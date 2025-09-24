@@ -7,6 +7,8 @@
 #include <thread>
 #include <functional>
 
+#include "global_address.hpp"
+
 // RDMA operation types
 /**
  * @brief Types of RDMA operations supported by the simulation.
@@ -21,7 +23,7 @@ struct RDMAOp {
     std::chrono::high_resolution_clock::time_point start_time; ///< Operation start timestamp
     std::chrono::high_resolution_clock::time_point end_time;   ///< Operation end timestamp
     RDMAOpType type;
-    size_t addr;
+    GlobalAddress addr;
     union {
         struct { // For READ
             uint8_t* buffer;

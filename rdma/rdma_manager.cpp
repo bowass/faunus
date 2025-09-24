@@ -1,14 +1,15 @@
-#include "../include/rdma_manager.hpp"
-#include "../include/faunus_config.hpp"
+#include "../rdma/rdma_manager.hpp"
 #include <thread>
 #include <chrono>
 #include <thread>
 #include <chrono>
+#include <iostream>
 
 // Private helper to execute mapped RDMA operation
-bool RDMAManager::execute_rdma(RDMAOp& op, const GlobalAddress& gaddr) {
+bool RDMAManager::execute_rdma(RDMAOp& op) {
+    // std::cout << "type: " << static_cast<int>(op.type) << " gaddr: " << static_cast<uint64_t>(op.addr) << std::endl;
     size_t local_addr;
-    MemoryServer* server = get_server(gaddr, local_addr);
+    MemoryServer* server = get_server(op.addr, local_addr);
     if (!server) return false;
     RDMAOp local_op = op;
     local_op.addr = local_addr;
@@ -46,23 +47,26 @@ MemoryServer* RDMAManager::get_server(const GlobalAddress& gaddr, size_t& local_
 }
 
 
-bool RDMAManager::perform_op(RDMAOp& op, const GlobalAddress& gaddr) {
-    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(faunus_config::BASE_RTT_US / 2)));
+bool RDMAManager::perform_op(RDMAOp& op) {
+    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(base_rtt_us_ / 2)));
     op.start_time = std::chrono::high_resolution_clock::now();
-    bool result = execute_rdma(op, gaddr);
-    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(faunus_config::BASE_RTT_US / 2)));
+    bool result = execute_rdma(op);
+    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(base_rtt_us_ / 2)));
+    op.end_time = std::chrono::high_resolution_clock::now();
     return result;
 }
 
 
-void RDMAManager::perform_batch(std::vector<std::pair<RDMAOp&, GlobalAddress>>& ops) {
-    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(faunus_config::BASE_RTT_US / 2)));
+void RDMAManager::perform_batch(std::vector<RDMAOp*>& ops) {
+    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(base_rtt_us_ / 2)));
     auto batch_start = std::chrono::high_resolution_clock::now();
-    auto batch_end = batch_start + std::chrono::microseconds(static_cast<int64_t>(faunus_config::BASE_RTT_US));
-    for (auto& [op, gaddr] : ops) {
-        op.start_time = batch_start;
-        execute_rdma(op, gaddr);
-        op.end_time = batch_end;
+    for (auto* op : ops) {
+        op->start_time = batch_start;
+        execute_rdma(*op);
     }
-    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(faunus_config::BASE_RTT_US / 2)));
+    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(base_rtt_us_ / 2)));
+    auto batch_end = std::chrono::high_resolution_clock::now();
+    for (auto* op : ops) {
+        op->end_time = batch_end;
+    }
 }

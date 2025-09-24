@@ -1,0 +1,7 @@
+num_cs: 8
+threads_per_cs: 8
+num_ms: 8
+mem_per_ms: 33554432
+cas_delay_us: 50
+base_rtt_us: 15
+# Add more config fields as needed

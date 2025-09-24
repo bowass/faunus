@@ -1,10 +1,9 @@
 
 
-#include "../include/rdma_simulation.hpp"
-#include "../include/faunus_config.hpp"
+#include "../rdma/rdma_simulation.hpp"
 #include <cstring>
 #include <cassert>
-
+#include <iostream>
 
 RDMASimulation::RDMASimulation(size_t memory_size)
     : memory_(memory_size, 0) {}
@@ -28,6 +27,7 @@ bool RDMASimulation::rdma_write(RDMAOp& op) {
     op.start_time = std::chrono::high_resolution_clock::now();
     if (op.addr + op.op.write.bytes > memory_.size() || !op.op.write.buffer) {
         op.end_time = std::chrono::high_resolution_clock::now();
+        std::cout << "Write failed: addr=" << op.addr << " bytes=" << op.op.write.bytes << " memsize=" << memory_.size() << std::endl;
         return false;
     }
     std::copy(op.op.write.buffer, op.op.write.buffer + op.op.write.bytes, memory_.begin() + op.addr);
@@ -39,7 +39,7 @@ bool RDMASimulation::rdma_write(RDMAOp& op) {
 bool RDMASimulation::rdma_cas(RDMAOp& op) {
     assert(op.type == RDMAOpType::CAS);
     op.start_time = std::chrono::high_resolution_clock::now();
-    std::this_thread::sleep_for(std::chrono::microseconds(faunus_config::CAS_DELAY_US));
+    // std::this_thread::sleep_for(std::chrono::microseconds(faunus_config::CAS_DELAY_US));
     bool result = false;
     if (op.addr + sizeof(uint64_t) <= memory_.size()) {
         uint64_t* ptr = reinterpret_cast<uint64_t*>(&memory_[op.addr]);

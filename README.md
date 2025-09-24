@@ -70,3 +70,7 @@ Batch WRITE 1 latency(us): 11.01
 ## License
 MIT
 
+# TODO
+- YCSB workloads
+- implement our KV-tree
+- implement Sherman, Marlin and maybe Deft
