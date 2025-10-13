@@ -6,6 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <set>
+
+#include "../util/logging.hpp"
 
 using size_t = std::size_t;
 using int64_t = std::int64_t;
@@ -28,7 +31,7 @@ public:
  */
 class SlabAllocator {
 public:
-    SlabAllocator(size_t slab_size, size_t num_slabs, Allocator* allocator)
+    SlabAllocator(size_t slab_size, size_t num_slabs, std::shared_ptr<Allocator> allocator)
         : slab_size_(slab_size), num_slabs_(num_slabs), allocator_(allocator) {
         get_slabs_nolock(num_slabs_);
     }
@@ -38,11 +41,11 @@ public:
         int64_t offset = get_free_slab_nolock();
         if (offset != -1) return offset;
         // No free slab, grow
-        std::cerr << "[SlabAllocator] Growing slab for size " << slab_size_ << " by " << num_slabs_ << std::endl;
+        LOG_DEBUG("[SlabAllocator] Growing slab for size " << slab_size_ << " by " << num_slabs_);
         get_slabs_nolock(num_slabs_);
         offset = get_free_slab_nolock();
         if (offset == -1) {
-            std::cerr << "[SlabAllocator] Still failed to allocate after growth for size " << slab_size_ << std::endl;
+            LOG_DEBUG("[SlabAllocator] Still failed to allocate after growth for size " << slab_size_);
         }
         return offset;
     }
@@ -83,7 +86,7 @@ private:
     std::vector<int64_t> free_list_;
     size_t used_chunks_ = 0;
     std::mutex mu_;
-    Allocator* allocator_;
+    std::shared_ptr<Allocator> allocator_;
 };
 
 /**
@@ -92,22 +95,26 @@ private:
 class LocalAllocator {
 public:
     // sizes: list of chunk sizes, num_chunks: number of chunks per size
-    LocalAllocator(const std::vector<size_t>& sizes, size_t num_chunks_per_slab, Allocator* allocator)
-        : allocator_(allocator), num_chunks_per_slab_(num_chunks_per_slab) {
+    LocalAllocator(const std::set<size_t>& sizes, size_t num_chunks_per_slab, std::shared_ptr<Allocator> allocator)
+        : allocator_(allocator) {
         for (auto sz : sizes) {
+            LOG_DEBUG("Creating slab for size " << sz << " at " << this);
             slabs_[sz] = std::make_unique<SlabAllocator>(sz, num_chunks_per_slab, allocator);
         }
     }
     // Thread-safe allocation for a given size
+    // TODO: is map thread-safe? are the allocate() and free() in SlabAllocator thread-safe?
     int64_t allocate(size_t size) {
+        LOG_DEBUG("Slabs at " << this);
         auto it = slabs_.find(size);
         if (it == slabs_.end()) {
-            std::cerr << "[LocalAllocator] No slab for size " << size << std::endl;
+            LOG_ERROR("[LocalAllocator] No slab for size " << size);
             return -1;
         }
+        LOG_DEBUG("[LocalAllocator] Allocating size " << size);
         int64_t result = it->second->allocate();
         if (result == -1) {
-            std::cerr << "[LocalAllocator] Allocation failed for size " << size << std::endl;
+            LOG_ERROR("[LocalAllocator] Allocation failed for size " << size);
         }
         return result;
     }
@@ -118,6 +125,5 @@ public:
     }
 private:
     std::unordered_map<size_t, std::unique_ptr<SlabAllocator>> slabs_;
-    Allocator* allocator_;
-    size_t num_chunks_per_slab_;
+    std::shared_ptr<Allocator> allocator_;
 };

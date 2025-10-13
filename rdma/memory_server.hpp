@@ -1,20 +1,13 @@
 #pragma once
 #include "rdma_simulation.hpp"
+#include "../concurrentqueue/concurrentqueue.h"
 #include <unordered_set>
-#include <queue>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
 #include <atomic>
 #include <utility>
 #include <future>
-#include <unordered_set>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <thread>
-#include <atomic>
-#include <utility>
 
 /**
  * @brief Simulated memory server providing RDMA access to a memory region.
@@ -36,8 +29,8 @@ private:
     std::mutex mu_;
     // Worker thread and queue
     std::thread worker_;
-    std::queue<std::pair<size_t, std::promise<size_t>*>> alloc_queue_;
-    std::queue<size_t> free_queue_;
+    moodycamel::ConcurrentQueue<std::pair<size_t, std::promise<size_t>*>> alloc_queue_;
+    moodycamel::ConcurrentQueue<size_t> free_queue_;
     std::mutex queue_mu_;
     std::condition_variable queue_cv_;
     std::atomic<bool> stop_ = false;

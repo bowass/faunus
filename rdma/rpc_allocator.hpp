@@ -16,7 +16,7 @@
  */
 class RPCAllocator : public Allocator {
 public:
-    RPCAllocator(std::vector<MemoryServer*>& servers)
+    RPCAllocator(std::vector<std::shared_ptr<MemoryServer>>& servers)
         : servers_(servers) {}
     // Allocate a chunk, returns global address offset or -1 if none available
     int64_t allocate(size_t chunk_size) override {
@@ -34,7 +34,7 @@ public:
         servers_[server_idx]->enqueue_free(local_offset);
     }
 private:
-    std::vector<MemoryServer*>& servers_;
+    std::vector<std::shared_ptr<MemoryServer>>& servers_;
     size_t pick_server(size_t chunk_size) {
         // Simple round-robin or hash
         static std::atomic<size_t> rr{0};

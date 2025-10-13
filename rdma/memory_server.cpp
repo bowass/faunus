@@ -1,4 +1,5 @@
 #include "memory_server.hpp"
+#include <chrono>
 
 
 // Track allocations and frees
@@ -15,44 +16,42 @@ MemoryServer::~MemoryServer() {
 }
 // Enqueue allocation request
 void MemoryServer::enqueue_alloc(size_t size, std::promise<size_t>& promise) {
-    {
-        std::lock_guard<std::mutex> lock(queue_mu_);
-        alloc_queue_.emplace(size, &promise);
-    }
+    alloc_queue_.enqueue(std::make_pair(size, &promise));
     queue_cv_.notify_one();
 }
 
 // Enqueue free request
 void MemoryServer::enqueue_free(size_t offset) {
-    {
-        std::lock_guard<std::mutex> lock(queue_mu_);
-        free_queue_.push(offset);
-    }
+    free_queue_.enqueue(offset);
     queue_cv_.notify_one();
 }
 
 // Worker loop for processing allocation/free requests
 void MemoryServer::worker_loop() {
     while (!stop_) {
-        std::unique_lock<std::mutex> lock(queue_mu_);
-        queue_cv_.wait(lock, [this]{ return stop_ || !alloc_queue_.empty() || !free_queue_.empty(); });
-        if (stop_) break;
+        bool has_work = false;
+        
         // Process alloc requests
-        while (!alloc_queue_.empty()) {
-            auto [size, promise_ptr] = alloc_queue_.front();
-            alloc_queue_.pop();
-            lock.unlock();
-            size_t offset = allocate(size);
-            promise_ptr->set_value(offset);
-            lock.lock();
+        std::pair<size_t, std::promise<size_t>*> alloc_item;
+        while (alloc_queue_.try_dequeue(alloc_item)) {
+            has_work = true;
+            size_t offset = allocate(alloc_item.first);
+            alloc_item.second->set_value(offset);
         }
+        
         // Process free requests
-        while (!free_queue_.empty()) {
-            size_t offset = free_queue_.front();
-            free_queue_.pop();
-            lock.unlock();
-            free(offset);
-            lock.lock();
+        size_t free_offset;
+        while (free_queue_.try_dequeue(free_offset)) {
+            has_work = true;
+            free(free_offset);
+        }
+        
+        // If no work was done, wait for notification
+        if (!has_work && !stop_) {
+            std::unique_lock<std::mutex> lock(queue_mu_);
+            queue_cv_.wait_for(lock, std::chrono::milliseconds(1), [this]{ 
+                return stop_.load(); 
+            });
         }
     }
 }
