@@ -3,7 +3,10 @@
 *.out
 *.a
 *.so
+*.pyc
+__pycache__/
 faunus_sim
+kv_test
 
 # Editor files
 *.swp
@@ -16,8 +19,12 @@ faunus_sim
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs and results
 *.log
-
-# Temporary files
-tmp.cpp
+logs/
+thread_logs/
+thread_stats/
+results/
+output/
+benchmark_results/
+profiling_results/
