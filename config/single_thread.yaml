@@ -1,0 +1,21 @@
+num_cs: 1
+threads_per_cs: 1
+num_ms: 1
+mem_per_ms: 1073741824
+cas_delay_us: 2
+base_rtt_us: 1
+initial_slabs_per_size: 32768
+maintenance_cs: 1
+threads_per_maintenance_cs: 1
+log_level: ERROR
+# log_level: DEBUG
+ops_per_client: 100000
+warmup_inserts: 1000000
+distribution:
+  type: uniform
+  key_space: 200000000
+operation_mix:
+  insert: 1.0
+  read: 0.0
+  update: 0.0
+  delete: 0.0
