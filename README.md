@@ -153,6 +153,8 @@ All workers pull from the same queue, so slow threads don’t cap throughput. Ke
 - Expose per-thread RDMA verb breakdowns
 - Faunus implementation
 	- Is there a bug in the current implementation?
+	- Think about a way to optimize splits, including making clients trigger less splits
+		- Maybe change watermarks?
 	- Implement `update`, maybe also `delete`
 - Sherman + Marlin implementation
 - Store latencies per-thread

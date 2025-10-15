@@ -22,7 +22,8 @@ KV_SRC = $(SRC_DIR)/kv_test.cpp \
          $(RDMA_DIR)/rdma_manager.cpp \
          $(KV_DIR)/faunus_index.cpp \
          $(KV_DIR)/index_cache.cpp \
-         $(UTIL_DIR)/profiler.cpp
+         $(UTIL_DIR)/profiler.cpp \
+         $(UTIL_DIR)/cpu_affinity.cpp
 KV_OBJ = $(KV_SRC:.cpp=.o)
 KV_TARGET = kv_test
 

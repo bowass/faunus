@@ -112,6 +112,7 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
                 if (cached_node.header.lock && !from_smo) {
                     LOG_DEBUG("Cached node is locked, invalidating and falling through to tree traversal");
                     cache_->invalidate(cached_address);
+                    cache_->invalidate_key_range(key); // Also invalidate any parent pointers
                 } else {
                     // Verify the cached node still contains the key in its fence
                     if (key >= cached_node.header.fence.first && key < cached_node.header.fence.second) {
@@ -119,8 +120,8 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
                         return FindNodeResult::FOUND;
                     } else {
                         LOG_DEBUG("Cached node fence no longer contains key, invalidating");
-                        // cache_->invalidate_key_range(key);
                         cache_->invalidate(cached_address);
+                        cache_->invalidate_key_range(key); // Invalidate broader range due to fence change
                     }
                 }
             } else if (cached_node.header.level < level) {
@@ -136,7 +137,8 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
                     LOG_DEBUG("Cached node level higher than target, starting traversal from cached node");
                 } else {
                     LOG_DEBUG("Cached node fence invalid, invalidating and starting from root");
-                    cache_->invalidate_key_range(key);
+                    cache_->invalidate(cached_address);  // Invalidate specific entry
+                    cache_->invalidate_key_range(key);   // Invalidate broader range
                 }
             }
         }
@@ -173,7 +175,8 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
             LOG_DEBUG("Node is locked, fail");
             // If this node is locked, invalidate any cache entries that might depend on it
             if (cache_) {
-                cache_->invalidate_key_range(key);
+                cache_->invalidate(node_address);     // Invalidate specific locked node
+                cache_->invalidate_key_range(key);    // Invalidate broader range
             }
             return FindNodeResult::LOCKED;
         }
@@ -190,7 +193,8 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
             assert(in_root);
             // Invalidate cache since tree structure has changed
             if (cache_) {
-                cache_->invalidate_key_range(key);
+                cache_->invalidate(node_address);     // Invalidate specific stale root
+                cache_->invalidate_key_range(key);    // Invalidate broader range
             }
             return FindNodeResult::NO_SUCH_LEVEL;
         }
@@ -214,21 +218,26 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
         
         // Validate that the next node we're about to traverse contains the key
         // If not, the cache or tree structure is inconsistent
-        // if (cache_ && next_address.raw != 0) {
-        //     // Read the next node header to validate fence
-        //     InternalNode next_node;
-        //     rdma_read_object(*rdma_mgr_, next_address, next_node);
+        if (cache_ && next_address.raw != 0) {
+            // Read the next node header to validate fence (only header, not full node)
+            Header next_header;
+            RDMAOp op{RDMAOpType::READ, next_address + offsetof(InternalNode, header)};
+            op.op.read.buffer = reinterpret_cast<uint8_t*>(&next_header);
+            op.op.read.bytes = sizeof(Header);
             
-        //     // Check if the key is actually within the fence of the next node
-        //     if (key < next_node.header.fence.first || key >= next_node.header.fence.second) {
-        //         LOG_DEBUG("Next node fence does not contain key - tree structure inconsistent, invalidating cache");
-        //         cache_->invalidate_key_range(key);
-        //         // Restart the search from root
-        //         node_address = get_root_offset();
-        //         in_root = true;
-        //         continue;
-        //     }
-        // }
+            if (rdma_mgr_->perform_op(op)) {
+                // Check if the key is actually within the fence of the next node
+                if (key < next_header.fence.first || key >= next_header.fence.second) {
+                    LOG_DEBUG("Next node fence does not contain key - tree structure inconsistent, invalidating cache");
+                    cache_->invalidate(node_address);      // Invalidate current node
+                    cache_->invalidate_key_range(key);     // Invalidate broader range
+                    // Restart the search from root
+                    node_address = get_root_offset();
+                    in_root = true;
+                    continue;
+                }
+            }
+        }
         
         node_address = next_address;
         in_root = false;
@@ -392,7 +401,8 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         LOG_DEBUG("After find_node: " << find_result);
         if (find_result != FindNodeResult::FOUND) {
             // print_tree();
-            LOG_WARN("Find result of " << key << ", attempt = " << attempt);
+            if (attempt > 10000) LOG_ERROR("Find result of " << key << ", attempt = " << attempt);
+            else LOG_WARN("Find result of " << key << ", attempt = " << attempt);
             continue; // retry
         }
 
@@ -423,9 +433,11 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         
         // smo or bad range - retry
         if (leaf.header.lock || key < leaf.header.fence.first || key >= leaf.header.fence.second) {
-            LOG_WARN("Leaf lock: " << leaf.header.lock << ". Key: " << key << ", Fence: (" << leaf.header.fence.first << ", " << leaf.header.fence.second << "), retrying");
-            // TODO: should invalidate entry - idk if it works
-            cache_->invalidate_key_range(key);
+            if (attempt > 10000) LOG_ERROR("Leaf address: " << leaf_address << ", lock: " << leaf.header.lock << ". Key: " << key << ", Fence: (" << leaf.header.fence.first << ", " << leaf.header.fence.second << "), retrying");
+            else LOG_WARN("Leaf lock: " << leaf.header.lock << ". Key: " << key << ", Fence: (" << leaf.header.fence.first << ", " << leaf.header.fence.second << "), retrying");
+            if (cache_) {
+                cache_->invalidate_key_range(key);     // Invalidate broader range including parent pointers
+            }
             continue;
         }
 
@@ -434,9 +446,13 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         auto candidate_kvs = get_candidate_kvs(leaf, fp, success, false, false);
         // smo - retry
         if (candidate_kvs.empty() && !success) {
-            LOG_WARN("Stuck here, leaf address: " << leaf_address);
-            // LOG_WARN("Found SMO in candidates, fail: size - " << candidate_kvs.size() << " success - " << success);
-            // print_tree();
+            if (attempt > 10000) LOG_WARN("Stuck here, leaf address: " << leaf_address);
+            else LOG_WARN("Stuck here, leaf address: " << leaf_address);
+            // SMO detected, invalidate cache since tree structure is changing
+            if (cache_) {
+                cache_->invalidate(leaf_address);
+                cache_->invalidate_key_range(key);
+            }
             continue;
         }
         // search for an existing key
@@ -490,6 +506,11 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
                 // after re-reading - assert leaf is still valid
                 if (leaf.header.lock || key < leaf.header.fence.first || key >= leaf.header.fence.second) {
                     LOG_DEBUG("After re-read, leaf is locked or key out of fence, retry");
+                    // Invalidate cache since leaf state changed after our operation
+                    if (cache_) {
+                        cache_->invalidate(leaf_address);
+                        cache_->invalidate_key_range(key);
+                    }
                     break;
                 }
             }
@@ -505,6 +526,11 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         // leaf is already updated
         // SMO already dealt with duplicates
         if (leaf.header.lock || key < leaf.header.fence.first || key >= leaf.header.fence.second) {
+            // Even though insertion succeeded, leaf changed - invalidate cache
+            if (cache_) {
+                cache_->invalidate(leaf_address);
+                cache_->invalidate_key_range(key);
+            }
             return true;
         }
         // trigger SMO if needed
@@ -520,6 +546,11 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
                 success = request_smo(FaunusMaintenanceRPC::SPLIT, leaf_address);
             }
             assert(success);
+            // Invalidate cache after SMO since tree structure will change
+            if (cache_) {
+                cache_->invalidate(leaf_address);
+                cache_->invalidate_key_range(key);
+            }
             return true;
         }
         // else, handle duplicates manually
@@ -564,6 +595,7 @@ bool FaunusIndex::lock_unlock_kvblocks(GlobalAddress leaf_address, bool to_lock)
 }
 
 bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
+    Profiler::Scoped total_scope("faunus.split_leaf");
     // Lock the leaf
     // LOG_WARN("Splitting leaf at " << leaf_address);
     bool success = trylock_node(leaf_address);
@@ -572,6 +604,7 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
         return false;
     }
 
+    // TODO: coalesce with the following leaf read in a single RTT
     // Acquire KVBlock locks
     success = lock_unlock_kvblocks(leaf_address, true);
     assert(success);
@@ -704,6 +737,8 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
     assert(success);
     // LOG_WARN("Inserted new fence into parent");
 
+    // Release node lock
+    assert(release_node(leaf_address));
     // Invalidate cache entries that might be affected by the split
     if (cache_) {
         // Invalidate any cached nodes that might contain keys in the affected range
@@ -713,23 +748,29 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
         LOG_DEBUG("Invalidated cache entries for split leaf range");
     }
 
-    // Release node lock
-    assert(release_node(leaf_address));
     LOG_WARN("Finished splitting leaf at " << leaf_address << " into new leaf " << new_leaf_address);
     // print_tree();
     return true;
 }
 
 bool FaunusIndex::insert_internal_entry(const Key& key, GlobalAddress new_child_addr, size_t level) {
+    Profiler::Scoped total_scope("faunus.insert_internal_entry");
     bool success;
     GlobalAddress node_address;
     InternalNode node;
     for (size_t attempt = 0; attempt < 1000000; attempt++) {
+        if (attempt > 1000) {
+            std::cout << "Attempting to find leaf address for key " << key << " at level " << level << ", attempt = " << attempt << std::endl;
+        }
         // find leaf address
         LOG_DEBUG("Before find_node");
         // from SMO true!!!
         // LOG_WARN("Searching for interval node at level " << level << " for key " << key << " to insert new child " << new_child_addr);
-        auto find_result = find_node(key, node_address, level, true);
+        FindNodeResult find_result;
+        {
+            Profiler::Scoped scope("faunus.insert_internal_entry.find_node");
+            find_result = find_node(key, node_address, level, true);
+        }
         assert(find_result != FindNodeResult::UNKNOWN);
         if (find_result == FindNodeResult::NO_SUCH_LEVEL) {
             // need to create a new root
@@ -830,6 +871,11 @@ bool FaunusIndex::insert_internal_entry(const Key& key, GlobalAddress new_child_
 
         // release lock
         assert(rdma_release_lock(*rdma_mgr_, lock_address));
+
+        if (cache_ && !need_split) {
+            cache_->invalidate_key_range(key);
+            LOG_DEBUG("Invalidated cache entries for internal node update");
+        }
         return true;
     }
     return false; // deadlock???

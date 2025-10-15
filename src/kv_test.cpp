@@ -16,6 +16,8 @@
 #include <filesystem>
 #include <fstream>
 #include <unordered_map>
+#include <condition_variable>
+#include <mutex>
 #include "../rdma/rdma_manager.hpp"
 #include "../rdma/memory_server.hpp"
 #include "../rdma/rpc_allocator.hpp"
@@ -27,6 +29,7 @@
 #include "../util/distribution.hpp"
 #include "../util/key_management.hpp"
 #include "../util/benchmark.hpp"
+#include "../util/cpu_affinity.hpp"
 
 // Using utility classes from dedicated headers
 
@@ -45,6 +48,50 @@ int main(int argc, char* argv[]) {
     set_log_level(config.log_level);
     faunus_log::setup_thread_log();
     Profiler::reset();
+    
+    // Validate CPU binding configuration
+    if (config.cpu_binding_enabled) {
+        if (!util::CPUAffinity::is_supported()) {
+            LOG_ERROR("CPU binding requested but not supported on this platform");
+            return 1;
+        }
+        
+        size_t available_cores = util::CPUAffinity::get_cpu_count();
+        size_t required_cores = config.num_cs + config.maintenance_cs;  // Total CS + maintenance CS
+        size_t max_core = config.cpu_binding_start_core + required_cores - 1;
+        
+        if (max_core >= available_cores) {
+            LOG_ERROR("CPU binding configuration requires cores " 
+                << config.cpu_binding_start_core << "-" << max_core 
+                << " but only " << available_cores << " cores available (0-" << (available_cores-1) << ")");
+            return 1;
+        }
+        
+        LOG_INFO("CPU binding enabled: will bind " << config.num_cs 
+            << " compute servers and " << config.maintenance_cs << " maintenance servers to cores " 
+            << config.cpu_binding_start_core << "-" << max_core 
+            << " (total cores available: " << available_cores << ")");
+            
+        // Check for core isolation if required
+        if (config.cpu_isolation_required) {
+            std::vector<size_t> required_core_ids;
+            for (size_t i = 0; i < required_cores; ++i) {
+                required_core_ids.push_back(config.cpu_binding_start_core + i);
+            }
+            
+            if (!util::CPUAffinity::check_core_isolation(required_core_ids)) {
+                LOG_ERROR("CPU isolation required but cores are not properly isolated");
+                LOG_ERROR("To setup core isolation, run the following and reboot:");
+                LOG_ERROR("\n" << util::CPUAffinity::get_isolation_recommendations(required_cores));
+                return 1;
+            }
+            
+            LOG_INFO("All required cores are properly isolated - excellent for accurate simulations");
+        } else {
+            LOG_WARN("CPU isolation not enforced - other processes may interfere with timing");
+            LOG_WARN("For best results, enable cpu_isolation_required and setup kernel isolation");
+        }
+    }
 
     // Create memory servers
     std::vector<std::shared_ptr<MemoryServer>> mem_servers;
@@ -84,18 +131,35 @@ int main(int argc, char* argv[]) {
     }
 
     // Maintenance compute servers and queues
+    // TODO: add caches for maintenance servers
     LOG_INFO("Launching " << num_maintenance_cs << " maintenance compute servers, " << threads_per_maintenance_cs << " threads each.");
     assert(num_maintenance_cs == 0 || threads_per_maintenance_cs > 0);
+    // Create caches per maintenance compute server (shared among threads in the same CS)
+    // Cache internal nodes at level 1 (one level above leaves)
+    std::vector<std::shared_ptr<faunus_index_internal::IndexCache>> mcs_caches(num_cs);
+    for (size_t mcs_id = 0; mcs_id < num_cs; ++mcs_id) {
+        mcs_caches[mcs_id] = std::make_shared<faunus_index_internal::IndexCache>(32768, 2); // 1024 entries, level 2
+        LOG_INFO("Created cache for CS " << mcs_id << " targeting level 2");
+    }
     for (size_t mcs_id = 0; mcs_id < num_maintenance_cs; ++mcs_id) {
         auto rpc_allocator = std::make_shared<RPCAllocator>(mem_servers);
         auto local_allocator = std::make_shared<LocalAllocator>(sizes, initial_slabs_per_size, rpc_allocator);
+        // TODO: for some reason MCS caches makes stuff REAL slow
+        // auto cache = mcs_caches[mcs_id];
+        auto cache = nullptr;
 
-        auto maintenance_worker = [mcs_id, root_offset_ptr](size_t tid, ThreadStats& stat, std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator) {
-            // Maintenance workers don't need cache since they work on different data
-            FaunusIndex index(rdma_mgr, allocator, root_offset_ptr, nullptr);
+        auto maintenance_worker = [mcs_id, root_offset_ptr, cache](size_t tid, ThreadStats& stat, std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator) {
+            FaunusIndex index(rdma_mgr, allocator, root_offset_ptr, cache);
             index.maintenance_worker(mcs_id, tid);
         };
-        maintenance_compute_servers.push_back(std::make_shared<ComputeServer>(mcs_id, threads_per_maintenance_cs, rdma_mgr, local_allocator, maintenance_worker));
+        
+        // CPU binding for maintenance CS: they get cores after the main CS
+        std::optional<size_t> mcs_core = std::nullopt;
+        if (config.cpu_binding_enabled) {
+            mcs_core = config.cpu_binding_start_core + config.num_cs + mcs_id;
+        }
+        
+        maintenance_compute_servers.push_back(std::make_shared<ComputeServer>(mcs_id, threads_per_maintenance_cs, rdma_mgr, local_allocator, maintenance_worker, mcs_core, config.cpu_isolation_required));
     }
 
     // Use queued-sets to prevent duplicate maintenance requests (more efficient)
@@ -106,11 +170,10 @@ int main(int argc, char* argv[]) {
     }
     for (auto& mcs : maintenance_compute_servers) mcs->start();
     
-    std::atomic<size_t> insert_count{0};
-    std::atomic<size_t> read_count{0};
-    std::atomic<size_t> update_count{0};
-    std::atomic<size_t> delete_count{0};
-
+    // Removed redundant atomic counters to eliminate unnecessary thread synchronization:
+    // These were causing performance overhead without providing useful functionality
+    // since operation counts are already tracked per-thread in ThreadStats
+    
     std::vector<std::vector<faunus_util::WorkerSummary>> worker_summaries(num_cs, std::vector<faunus_util::WorkerSummary>(threads_per_cs));
 
     faunus_util::OperationPicker op_picker(config.operation_mix);
@@ -125,6 +188,12 @@ int main(int argc, char* argv[]) {
     const size_t warmup_total = config.warmup_inserts;
     const size_t ops_per_client = config.ops_per_client;
 
+    // Create warmup barrier to synchronize all clients before starting main iterations
+    // Custom barrier implementation for C++17 compatibility
+    std::atomic<size_t> warmup_counter(0);
+    std::mutex warmup_mutex;
+    std::condition_variable warmup_cv;
+
     // Create caches per compute server (shared among threads in the same CS)
     // Cache internal nodes at level 1 (one level above leaves)
     std::vector<std::shared_ptr<faunus_index_internal::IndexCache>> cs_caches(num_cs);
@@ -136,11 +205,11 @@ int main(int argc, char* argv[]) {
     for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
         auto rpc_allocator = std::make_shared<RPCAllocator>(mem_servers);
         auto local_allocator = std::make_shared<LocalAllocator>(sizes, initial_slabs_per_size, rpc_allocator);
-        auto cache = cs_caches[cs_id];
+        // auto cache = cs_caches[cs_id];
+        auto cache = nullptr;
 
-        auto worker = [cs_id, root_offset_ptr, &op_picker, &worker_summaries, &insert_count,
-                       &read_count, &update_count, &delete_count, ops_per_client, warmup_total,
-                       total_clients, &config, cache](int tid, ThreadStats& stat,
+        auto worker = [cs_id, root_offset_ptr, &op_picker, &worker_summaries, &warmup_counter, &warmup_mutex, &warmup_cv, total_clients,
+                       ops_per_client, warmup_total, &config, cache](int tid, ThreadStats& stat,
                                               std::shared_ptr<RDMAManager> rdma_mgr,
                                               std::shared_ptr<LocalAllocator> allocator) {
             auto kv_index = FaunusIndex(rdma_mgr, allocator, root_offset_ptr, cache);
@@ -162,7 +231,6 @@ int main(int argc, char* argv[]) {
                 auto end = std::chrono::high_resolution_clock::now();
                 recorder.record_result(OperationKind::Insert, start, end, ok);
                 if (ok) {
-                    insert_count.fetch_add(1, std::memory_order_relaxed);
                     if (update_local_state) {
                         if (key_set.add_new(key)) {
                             sampler.update_active_count(key_set.active_count());
@@ -180,7 +248,6 @@ int main(int argc, char* argv[]) {
                 bool ok = kv_index.read(key, val);
                 auto end = std::chrono::high_resolution_clock::now();
                 recorder.record_result(OperationKind::Read, start, end, ok);
-                read_count.fetch_add(1, std::memory_order_relaxed);
                 return ok;
             };
 
@@ -190,7 +257,6 @@ int main(int argc, char* argv[]) {
                 bool ok = kv_index.update(key, new_value);
                 auto end = std::chrono::high_resolution_clock::now();
                 recorder.record_result(OperationKind::Update, start, end, ok);
-                update_count.fetch_add(1, std::memory_order_relaxed);
                 return ok;
             };
 
@@ -200,7 +266,6 @@ int main(int argc, char* argv[]) {
                 auto end = std::chrono::high_resolution_clock::now();
                 recorder.record_result(OperationKind::Delete, start, end, ok);
                 if (ok) {
-                    delete_count.fetch_add(1, std::memory_order_relaxed);
                     key_set.deactivate(slot);
                     sampler.update_active_count(key_set.active_count());
                 }
@@ -219,7 +284,23 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            // reset stats
+            recorder.reset();
             sampler.update_active_count(key_set.active_count());
+
+            // Wait for all threads to complete warmup before starting main benchmark
+            // Custom barrier implementation for C++17 compatibility
+            {
+                std::unique_lock<std::mutex> lock(warmup_mutex);
+                size_t count = warmup_counter.fetch_add(1) + 1;
+                if (count == total_clients) {
+                    // Last thread to arrive - notify all waiting threads
+                    warmup_cv.notify_all();
+                } else {
+                    // Wait for all threads to arrive
+                    warmup_cv.wait(lock, [&] { return warmup_counter.load() == total_clients; });
+                }
+            }
 
             auto select_active_slot = [&]() -> std::optional<size_t> {
                 size_t active = key_set.active_count();
@@ -315,12 +396,24 @@ int main(int argc, char* argv[]) {
             Profiler::publish_thread_stats();
         };
 
-        compute_servers.push_back(std::make_shared<ComputeServer>(cs_id, threads_per_cs, rdma_mgr, local_allocator, worker));
+        // Determine CPU core binding for this CS
+        std::optional<size_t> core_id = std::nullopt;
+        if (config.cpu_binding_enabled) {
+            core_id = config.cpu_binding_start_core + cs_id;
+        }
+
+        compute_servers.push_back(std::make_shared<ComputeServer>(cs_id, threads_per_cs, rdma_mgr, local_allocator, worker, core_id, config.cpu_isolation_required));
     }
 
     auto benchmark_start = std::chrono::steady_clock::now();
     for (auto& cs : compute_servers) cs->start();
     for (auto& cs : compute_servers) cs->join();
+
+    if (num_maintenance_cs > 0 && threads_per_maintenance_cs > 0) {
+        FaunusIndex::stop_maintenance(threads_per_maintenance_cs);
+    }
+    for (auto& mcs : maintenance_compute_servers) mcs->join();
+
     auto benchmark_end = std::chrono::steady_clock::now();
     double elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(benchmark_end - benchmark_start).count();
     // Collect global stats
@@ -328,12 +421,32 @@ int main(int argc, char* argv[]) {
     size_t total_succeeded = 0;
     double sum_attempted_throughput = 0.0;
     double sum_succeeded_throughput = 0.0;
-    for (const auto& per_cs : worker_summaries) {
-        for (const auto& summary : per_cs) {
+    
+    // Calculate operation counts from per-thread statistics instead of removed atomic counters
+    size_t total_insert_count = 0;
+    size_t total_read_count = 0;
+    size_t total_update_count = 0;
+    size_t total_delete_count = 0;
+    
+    for (size_t cs_id = 0; cs_id < compute_servers.size(); ++cs_id) {
+        const auto& thread_stats_vec = compute_servers[cs_id]->get_thread_stats();
+        for (size_t tid = 0; tid < threads_per_cs; ++tid) {
+            const auto& summary = worker_summaries[cs_id][tid];
             total_attempted += summary.attempted;
             total_succeeded += summary.succeeded;
             sum_attempted_throughput += summary.attempted_throughput;
             sum_succeeded_throughput += summary.succeeded_throughput;
+            
+            // Sum operation counts from thread statistics
+            const auto& thread_stat = thread_stats_vec[tid];
+            total_insert_count += thread_stat.per_op[static_cast<size_t>(OperationKind::Insert)].successes + 
+                                  thread_stat.per_op[static_cast<size_t>(OperationKind::Insert)].failures;
+            total_read_count += thread_stat.per_op[static_cast<size_t>(OperationKind::Read)].successes + 
+                                thread_stat.per_op[static_cast<size_t>(OperationKind::Read)].failures;
+            total_update_count += thread_stat.per_op[static_cast<size_t>(OperationKind::Update)].successes + 
+                                  thread_stat.per_op[static_cast<size_t>(OperationKind::Update)].failures;
+            total_delete_count += thread_stat.per_op[static_cast<size_t>(OperationKind::Delete)].successes + 
+                                  thread_stat.per_op[static_cast<size_t>(OperationKind::Delete)].failures;
         }
     }
 
@@ -357,8 +470,8 @@ int main(int argc, char* argv[]) {
           << "Sum per-client attempted throughput (ops/s): " << sum_attempted_throughput
           << " | Sum per-client succeeded throughput (ops/s): " << sum_succeeded_throughput << std::endl
           << std::defaultfloat;
-    std::cout << "Operation counts -> inserts: " << insert_count.load() << ", reads: " << read_count.load()
-              << ", updates: " << update_count.load() << ", deletes: " << delete_count.load() << std::endl;
+    std::cout << "Operation counts -> inserts: " << total_insert_count << ", reads: " << total_read_count
+              << ", updates: " << total_update_count << ", deletes: " << total_delete_count << std::endl;
     std::cout << "RDMA ops by type:";
     for (size_t i = 0; i < rdma_stats.op_counts.size(); ++i) {
         std::cout << " " << rdma_stats.op_counts[i];
@@ -372,6 +485,7 @@ int main(int argc, char* argv[]) {
     size_t total_cache_evictions = 0;
     size_t total_invalid_ranges = 0;
     
+    // TODO: are the caches stats global for all CSs?
     for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
         auto cache_stats = cs_caches[cs_id]->get_stats();
         total_cache_hits += cache_stats.hits;
@@ -388,6 +502,22 @@ int main(int argc, char* argv[]) {
                   << ", invalid_ranges=" << cache_stats.invalid_ranges << std::endl;
     }
     
+    for (size_t mcs_id = 0; mcs_id < num_maintenance_cs; ++mcs_id) {
+        auto cache_stats = mcs_caches[mcs_id]->get_stats();
+        total_cache_hits += cache_stats.hits;
+        total_cache_misses += cache_stats.misses;
+        total_cache_entries += cache_stats.entries;
+        total_cache_evictions += cache_stats.evictions;
+        total_invalid_ranges += cache_stats.invalid_ranges;
+        
+        std::cout << "MCS " << mcs_id << " cache: hits=" << cache_stats.hits 
+                  << ", misses=" << cache_stats.misses 
+                  << ", hit_rate=" << std::fixed << std::setprecision(3) << cache_stats.hit_rate()
+                  << ", entries=" << cache_stats.entries
+                  << ", evictions=" << cache_stats.evictions 
+                  << ", invalid_ranges=" << cache_stats.invalid_ranges << std::endl;
+    }
+
     double overall_hit_rate = (total_cache_hits + total_cache_misses) == 0 ? 0.0 : 
         static_cast<double>(total_cache_hits) / static_cast<double>(total_cache_hits + total_cache_misses);
     std::cout << "Total cache: hits=" << total_cache_hits 
@@ -404,7 +534,7 @@ int main(int argc, char* argv[]) {
         });
 
         std::cout << "\n[Profiler] Top sections:" << std::endl;
-        size_t display_count = std::min<size_t>(20, sorted_sections.size());
+        size_t display_count = std::min<size_t>(50, sorted_sections.size());
         for (size_t i = 0; i < display_count; ++i) {
             const auto& [name, stats] = sorted_sections[i];
             double avg_ns = stats.count == 0 ? 0.0 : static_cast<double>(stats.total_ns) / static_cast<double>(stats.count);
@@ -418,6 +548,9 @@ int main(int argc, char* argv[]) {
     // Using faunus_util::operation_name instead of local lambda
 
     std::array<faunus_util::AggregatedOpStats, static_cast<size_t>(OperationKind::Count)> op_totals{};
+    
+    // Collect all latency samples for percentile calculation
+    std::array<std::vector<double>, static_cast<size_t>(OperationKind::Count)> all_samples;
 
     for (size_t cs_id = 0; cs_id < compute_servers.size(); ++cs_id) {
         for (size_t tid = 0; tid < threads_per_cs; ++tid) {
@@ -477,7 +610,21 @@ int main(int argc, char* argv[]) {
                     json_out << "null";
                 }
                 json_out << ",\n";
-                json_out << "      \"total_latency_us\": " << entry.total_latency_us << "\n";
+                json_out << "      \"total_latency_us\": " << entry.total_latency_us << ",\n";
+                
+                // Calculate percentiles for this thread
+                auto thread_samples = entry.latency_samples.get_samples();
+                if (!thread_samples.empty()) {
+                    auto [p50, p95, p99] = faunus_util::PercentileCalculator::calculate_standard(thread_samples);
+                    json_out << "      \"p50_latency_us\": " << p50 << ",\n";
+                    json_out << "      \"p95_latency_us\": " << p95 << ",\n";
+                    json_out << "      \"p99_latency_us\": " << p99 << ",\n";
+                } else {
+                    json_out << "      \"p50_latency_us\": null,\n";
+                    json_out << "      \"p95_latency_us\": null,\n";
+                    json_out << "      \"p99_latency_us\": null,\n";
+                }
+                json_out << "      \"sample_count\": " << entry.latency_samples.sample_count() << "\n";
                 json_out << "    }";
                 if (op_idx + 1 < static_cast<size_t>(OperationKind::Count)) json_out << ",";
                 json_out << "\n";
@@ -490,9 +637,27 @@ int main(int argc, char* argv[]) {
                     agg_entry.min_latency_us = std::min(agg_entry.min_latency_us, entry.min_latency_us);
                     agg_entry.max_latency_us = std::max(agg_entry.max_latency_us, entry.max_latency_us);
                 }
+                
+                // Collect latency samples for percentile calculation
+                auto samples = entry.latency_samples.get_samples();
+                all_samples[op_idx].insert(all_samples[op_idx].end(), samples.begin(), samples.end());
             }
             json_out << "  }\n";
             json_out << "}\n";
+        }
+    }
+
+    // Calculate percentiles for all operations using collected samples
+    for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
+        auto& agg_entry = op_totals[op_idx];
+        auto& samples = all_samples[op_idx];
+        
+        if (!samples.empty()) {
+            auto [p50, p95, p99] = faunus_util::PercentileCalculator::calculate_standard(samples);
+            agg_entry.p50_latency_us = p50;
+            agg_entry.p95_latency_us = p95;
+            agg_entry.p99_latency_us = p99;
+            agg_entry.sample_count = samples.size();
         }
     }
 
@@ -504,10 +669,10 @@ int main(int argc, char* argv[]) {
         summary_out << "  \"total_succeeded\": " << total_succeeded << ",\n";
         summary_out << "  \"elapsed_sec\": " << elapsed_seconds << ",\n";
         summary_out << "  \"operation_counts\": {\n";
-        summary_out << "    \"insert\": " << insert_count.load() << ",\n";
-        summary_out << "    \"read\": " << read_count.load() << ",\n";
-        summary_out << "    \"update\": " << update_count.load() << ",\n";
-        summary_out << "    \"delete\": " << delete_count.load() << "\n";
+        summary_out << "    \"insert\": " << total_insert_count << ",\n";
+        summary_out << "    \"read\": " << total_read_count << ",\n";
+        summary_out << "    \"update\": " << total_update_count << ",\n";
+        summary_out << "    \"delete\": " << total_delete_count << "\n";
         summary_out << "  },\n";
         summary_out << "  \"profiling\": {\n";
         size_t prof_idx = 0;
@@ -552,7 +717,30 @@ int main(int argc, char* argv[]) {
             } else {
                 summary_out << "null";
             }
-            summary_out << "\n    }";
+            summary_out << ",\n";
+            summary_out << "      \"p50_latency_us\": ";
+            if (agg.sample_count > 0) {
+                summary_out << agg.p50_latency_us;
+            } else {
+                summary_out << "null";
+            }
+            summary_out << ",\n";
+            summary_out << "      \"p95_latency_us\": ";
+            if (agg.sample_count > 0) {
+                summary_out << agg.p95_latency_us;
+            } else {
+                summary_out << "null";
+            }
+            summary_out << ",\n";
+            summary_out << "      \"p99_latency_us\": ";
+            if (agg.sample_count > 0) {
+                summary_out << agg.p99_latency_us;
+            } else {
+                summary_out << "null";
+            }
+            summary_out << ",\n";
+            summary_out << "      \"sample_count\": " << agg.sample_count << "\n";
+            summary_out << "    }";
             if (op_idx + 1 < static_cast<size_t>(OperationKind::Count)) summary_out << ",";
             summary_out << "\n";
         }
@@ -583,10 +771,10 @@ int main(int argc, char* argv[]) {
             if (!is_last) summary_out << ",";
             summary_out << "\n";
         };
-        write_throughput_entry("insert", insert_count.load(), op_totals[static_cast<size_t>(OperationKind::Insert)].successes, false);
-        write_throughput_entry("read", read_count.load(), op_totals[static_cast<size_t>(OperationKind::Read)].successes, false);
-        write_throughput_entry("update", update_count.load(), op_totals[static_cast<size_t>(OperationKind::Update)].successes, false);
-        write_throughput_entry("delete", delete_count.load(), op_totals[static_cast<size_t>(OperationKind::Delete)].successes, true);
+        write_throughput_entry("insert", total_insert_count, op_totals[static_cast<size_t>(OperationKind::Insert)].successes, false);
+        write_throughput_entry("read", total_read_count, op_totals[static_cast<size_t>(OperationKind::Read)].successes, false);
+        write_throughput_entry("update", total_update_count, op_totals[static_cast<size_t>(OperationKind::Update)].successes, false);
+        write_throughput_entry("delete", total_delete_count, op_totals[static_cast<size_t>(OperationKind::Delete)].successes, true);
         summary_out << "    }\n";
         summary_out << "  },\n";
         summary_out << "  \"cache\": {\n";
@@ -647,11 +835,6 @@ int main(int argc, char* argv[]) {
             LOG_ERROR("Failed to write profiling JSON to " << (stats_dir / "profiling.json"));
         }
     }
-
-    if (num_maintenance_cs > 0 && threads_per_maintenance_cs > 0) {
-        FaunusIndex::stop_maintenance(threads_per_maintenance_cs);
-    }
-    for (auto& mcs : maintenance_compute_servers) mcs->join();
 
     // At program end, close thread log
     faunus_log::close_thread_log();

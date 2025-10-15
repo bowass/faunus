@@ -4,6 +4,8 @@
 #include <thread>
 #include <functional>
 #include <array>
+#include <algorithm>
+#include <optional>
 #include "rdma_simulation.hpp"
 #include "rdma_manager.hpp"
 #include "local_allocator.hpp"
@@ -19,6 +21,49 @@ enum class OperationKind : uint8_t {
     Count
 };
 
+/**
+ * @brief Efficient circular buffer for latency samples (for percentile calculation)
+ */
+class LatencySampler {
+private:
+    static constexpr size_t MAX_SAMPLES = 1000000;  // Maximum samples stored per operation
+    std::vector<double> samples_;
+    size_t write_index_ = 0;
+    size_t count_ = 0;
+    bool is_full_ = false;
+
+public:
+    void add_sample(double latency_us) {
+        if (samples_.size() < MAX_SAMPLES) {
+            samples_.push_back(latency_us);
+        } else {
+            samples_[write_index_] = latency_us;
+            write_index_ = (write_index_ + 1) % MAX_SAMPLES;
+            if (!is_full_ && write_index_ == 0) {
+                is_full_ = true;
+            }
+        }
+        count_++;
+    }
+
+    std::vector<double> get_samples() const {
+        if (!is_full_) {
+            return std::vector<double>(samples_.begin(), samples_.begin() + std::min(count_, samples_.size()));
+        }
+        // For full circular buffer, return samples in chronological order
+        std::vector<double> result;
+        result.reserve(samples_.size());
+        for (size_t i = 0; i < samples_.size(); ++i) {
+            size_t idx = (write_index_ + i) % samples_.size();
+            result.push_back(samples_[idx]);
+        }
+        return result;
+    }
+
+    size_t sample_count() const { return std::min(count_, MAX_SAMPLES); }
+    bool has_samples() const { return count_ > 0; }
+};
+
 struct ThreadStats {
     struct Entry {
         size_t successes = 0;
@@ -26,6 +71,7 @@ struct ThreadStats {
         double total_latency_us = 0.0;
         double min_latency_us = std::numeric_limits<double>::max();
         double max_latency_us = 0.0;
+        LatencySampler latency_samples;  // For percentile calculation
 
         void record(double latency_us, bool success) {
             if (success) {
@@ -33,6 +79,7 @@ struct ThreadStats {
                 total_latency_us += latency_us;
                 if (latency_us < min_latency_us) min_latency_us = latency_us;
                 if (latency_us > max_latency_us) max_latency_us = latency_us;
+                latency_samples.add_sample(latency_us);
             } else {
                 failures++;
             }
@@ -43,6 +90,12 @@ struct ThreadStats {
 
     void record(OperationKind kind, double latency_us, bool success) {
         per_op[static_cast<size_t>(kind)].record(latency_us, success);
+    }
+
+    void reset() {
+        for (auto& entry : per_op) {
+            entry = Entry();
+        }
     }
 };
 
@@ -62,8 +115,10 @@ public:
      * @param rdma_mgr Reference to RDMA manager
      * @param allocator Local allocator
      * @param worker Worker function to execute in each thread
+     * @param core_id Optional core ID to bind this CS to (binds all threads to this core)
+     * @param use_exclusive_binding Use exclusive binding for better isolation
      */
-    ComputeServer(int id, int num_threads, std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, WorkerFunc worker);
+    ComputeServer(int id, int num_threads, std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, WorkerFunc worker, std::optional<size_t> core_id = std::nullopt, bool use_exclusive_binding = false);
     /**
      * @brief Start all worker threads.
      */
@@ -86,6 +141,8 @@ private:
     std::vector<std::thread> workers_;
     std::vector<ThreadStats> stats_;
     WorkerFunc worker_;
+    std::optional<size_t> core_id_;  // Core ID for CPU binding
+    bool use_exclusive_binding_;     // Use exclusive binding for isolation
 public:
     LocalAllocator* get_allocator() const { return allocator_.get(); }
 };

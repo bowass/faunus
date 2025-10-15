@@ -31,6 +31,10 @@ class OperationStats:
     min_latency_us: Optional[float] = None
     max_latency_us: Optional[float] = None
     total_latency_us: float = 0.0
+    p50_latency_us: Optional[float] = None
+    p95_latency_us: Optional[float] = None
+    p99_latency_us: Optional[float] = None
+    sample_count: int = 0
 
 
 @dataclass
@@ -54,6 +58,10 @@ class ThreadMetrics:
                 min_latency_us=_maybe_float(entry.get("min_latency_us")),
                 max_latency_us=_maybe_float(entry.get("max_latency_us")),
                 total_latency_us=float(entry.get("total_latency_us", 0.0)),
+                p50_latency_us=_maybe_float(entry.get("p50_latency_us")),
+                p95_latency_us=_maybe_float(entry.get("p95_latency_us")),
+                p99_latency_us=_maybe_float(entry.get("p99_latency_us")),
+                sample_count=int(entry.get("sample_count", 0)),
             )
         return ThreadMetrics(
             compute_server=int(data.get("compute_server", 0)),
@@ -117,9 +125,13 @@ def print_digest(summary: Dict[str, object], threads: Iterable[ThreadMetrics]) -
             avg = entry.get("avg_latency_us")
             min_latency = entry.get("min_latency_us")
             max_latency = entry.get("max_latency_us")
-            print(
-                f"  {name:<8} avg={_fmt_optional(avg)} min={_fmt_optional(min_latency)} max={_fmt_optional(max_latency)}"
-            )
+            p50 = entry.get("p50_latency_us")
+            p95 = entry.get("p95_latency_us")
+            p99 = entry.get("p99_latency_us")
+            sample_count = entry.get("sample_count", 0)
+            
+            print(f"  {name:<8} avg={_fmt_optional(avg)} min={_fmt_optional(min_latency)} max={_fmt_optional(max_latency)}")
+            print(f"           p50={_fmt_optional(p50)} p95={_fmt_optional(p95)} p99={_fmt_optional(p99)} samples={sample_count}")
 
     throughput = summary.get("throughput")
     if isinstance(throughput, dict):
@@ -208,6 +220,62 @@ def generate_plots(
         ax.set_ylabel("Latency (µs)")
         fig.tight_layout()
         fig.savefig(Path(f"{output_prefix}_latency_boxplot.png"), dpi=160)
+        plt.close(fig)
+
+    # Plot 2b: Percentile comparison per operation (from summary data)
+    per_op_latency: Dict[str, Dict[str, object]] = summary.get("per_operation_latency", {})  # type: ignore[assignment]
+    if per_op_latency:
+        operations_with_percentiles = []
+        p50_values = []
+        p95_values = []
+        p99_values = []
+        
+        for name, entry in per_op_latency.items():
+            p50 = _maybe_float(entry.get("p50_latency_us"))
+            p95 = _maybe_float(entry.get("p95_latency_us"))
+            p99 = _maybe_float(entry.get("p99_latency_us"))
+            
+            if p50 is not None and p95 is not None and p99 is not None:
+                operations_with_percentiles.append(name)
+                p50_values.append(p50)
+                p95_values.append(p95)
+                p99_values.append(p99)
+        
+        if operations_with_percentiles:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            x = range(len(operations_with_percentiles))
+            width = 0.25
+            
+            ax.bar([i - width for i in x], p50_values, width, label='P50', alpha=0.8)
+            ax.bar(x, p95_values, width, label='P95', alpha=0.8)
+            ax.bar([i + width for i in x], p99_values, width, label='P99', alpha=0.8)
+            
+            ax.set_xlabel('Operation')
+            ax.set_ylabel('Latency (µs)')
+            ax.set_title('Latency Percentiles by Operation (Overall)')
+            ax.set_xticks(x)
+            ax.set_xticklabels(operations_with_percentiles)
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(Path(f"{output_prefix}_percentiles.png"), dpi=160)
+            plt.close(fig)
+
+    # Plot 2c: Per-thread percentile comparison
+    thread_p99_data: Dict[str, List[float]] = {}
+    for tm in threads:
+        for name, op in tm.operations.items():
+            if op.p99_latency_us is not None:
+                thread_p99_data.setdefault(name, []).append(op.p99_latency_us)
+
+    if thread_p99_data:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        labels = list(thread_p99_data.keys())
+        data = [thread_p99_data[label] for label in labels]
+        ax.boxplot(data, labels=labels, showfliers=False)
+        ax.set_title("Per-thread P99 latency distribution (µs)")
+        ax.set_ylabel("P99 Latency (µs)")
+        fig.tight_layout()
+        fig.savefig(Path(f"{output_prefix}_p99_distribution.png"), dpi=160)
         plt.close(fig)
 
     # Plot 3: Success rate per thread (stacked by operation)

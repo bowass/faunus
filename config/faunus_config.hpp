@@ -46,6 +46,10 @@ struct FaunusConfig {
     size_t kv_per_thread = 1000;
     size_t initial_slabs_per_size = 1024;
     faunus_log::LogLevel log_level = faunus_log::LOG_INFO;
+    // CPU affinity configuration
+    bool cpu_binding_enabled = false;
+    size_t cpu_binding_start_core = 0;  // First core to use for CS binding
+    bool cpu_isolation_required = false;  // Require isolated cores for binding
     // Maintenance compute servers
     size_t maintenance_cs = 0;
     size_t threads_per_maintenance_cs = 0;
@@ -71,6 +75,9 @@ inline FaunusConfig load_faunus_config(const std::string& yaml_path) {
     if (node["kv_per_thread"]) cfg.kv_per_thread = node["kv_per_thread"].as<size_t>();
     if (node["initial_slabs_per_size"]) cfg.initial_slabs_per_size = node["initial_slabs_per_size"].as<size_t>();
     if (node["log_level"]) cfg.log_level = faunus_log::log_level_from_string(node["log_level"].as<std::string>());
+    if (node["cpu_binding_enabled"]) cfg.cpu_binding_enabled = node["cpu_binding_enabled"].as<bool>();
+    if (node["cpu_binding_start_core"]) cfg.cpu_binding_start_core = node["cpu_binding_start_core"].as<size_t>();
+    if (node["cpu_isolation_required"]) cfg.cpu_isolation_required = node["cpu_isolation_required"].as<bool>();
     if (node["maintenance_cs"]) cfg.maintenance_cs = node["maintenance_cs"].as<size_t>();
     if (node["threads_per_maintenance_cs"]) cfg.threads_per_maintenance_cs = node["threads_per_maintenance_cs"].as<size_t>();
     if (node["total_ops"]) cfg.total_ops = node["total_ops"].as<size_t>();
@@ -155,6 +162,14 @@ inline FaunusConfig load_faunus_config(const std::string& yaml_path) {
         cfg.distribution.key_space = minimum_space;
         LOG_WARN("distribution.key_space too small for requested workload; expanding to " << minimum_space);
     }
+    
+    // Validate CPU binding configuration
+    if (cfg.cpu_binding_enabled) {
+        // We need validation of CPU cores, but we'll do this in the main code
+        // since we need to include the CPU affinity utility
+        LOG_INFO("CPU binding enabled: starting from core " << cfg.cpu_binding_start_core);
+    }
+    
     // Add more fields as needed
     return cfg;
 }

@@ -23,11 +23,13 @@ struct LockFreeCacheEntry {
     InternalNode node;
     std::atomic<LockFreeCacheEntry*> next; // For chaining in hash table
     std::atomic<uint32_t> access_time; // Compact timestamp (32-bit seconds since epoch)
+    std::atomic<uint32_t> version; // Version number to detect stale entries
     std::atomic<bool> valid;
     
     LockFreeCacheEntry(GlobalAddress addr, const InternalNode& n) 
         : address(addr), node(n), next(nullptr), valid(true) {
         touch();
+        version.store(1, std::memory_order_relaxed); // Start with version 1
     }
         
     // Check if key falls within this node's fence range
@@ -53,6 +55,15 @@ struct LockFreeCacheEntry {
     
     uint32_t get_access_time() const {
         return access_time.load(std::memory_order_relaxed);
+    }
+    
+    // Version management for detecting stale entries
+    uint32_t get_version() const {
+        return version.load(std::memory_order_relaxed);
+    }
+    
+    void increment_version() {
+        version.fetch_add(1, std::memory_order_relaxed);
     }
 };
 

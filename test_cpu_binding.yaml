@@ -1,4 +1,4 @@
-num_cs: 4
+num_cs: 2
 threads_per_cs: 1
 num_ms: 1
 mem_per_ms: 1073741824
@@ -7,14 +7,13 @@ base_rtt_us: 2
 initial_slabs_per_size: 32768
 maintenance_cs: 1
 threads_per_maintenance_cs: 1
-log_level: ERROR
-# log_level: DEBUG
-ops_per_client: 100000
-warmup_inserts: 1000000
-# CPU core binding configuration
+log_level: INFO
+ops_per_client: 1000
+warmup_inserts: 100
+# CPU core binding configuration - bind each CS to dedicated cores
 cpu_binding_enabled: true
 cpu_binding_start_core: 0
-cpu_isolation_required: true
+cpu_isolation_required: false  # Set to true when cores are properly isolated
 distribution:
   type: uniform
   key_space: 200000000

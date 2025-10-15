@@ -74,6 +74,19 @@ std::optional<std::pair<GlobalAddress, InternalNode>> IndexCache::search(const K
     // Check first few entries in the primary bucket (most likely hits)
     for (int i = 0; i < 3 && current != nullptr; ++i) {
         if (current->is_valid() && current->contains_key(key)) {
+            // Check if entry is too old (simple staleness detection)
+            uint32_t current_time = static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            uint32_t entry_age = current_time - current->get_access_time();
+            
+            // If entry is older than 60 seconds, consider it potentially stale
+            if (entry_age > 60) {
+                current->invalidate();
+                increment_misses();
+                break; // Continue to comprehensive search
+            }
+            
             current->touch(); // Update access time
             increment_hits();
             return std::make_pair(current->address, current->node);
@@ -84,6 +97,18 @@ std::optional<std::pair<GlobalAddress, InternalNode>> IndexCache::search(const K
     // If not found in first few entries, fall back to comprehensive search
     LockFreeCacheEntry* entry = find_entry_by_key(key);
     if (entry && entry->is_valid()) {
+        // Check staleness for comprehensive search results too
+        uint32_t current_time = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        uint32_t entry_age = current_time - entry->get_access_time();
+        
+        if (entry_age > 60) {
+            entry->invalidate();
+            increment_misses();
+            return std::nullopt;
+        }
+        
         entry->touch(); // Update access time
         increment_hits();
         return std::make_pair(entry->address, entry->node);
@@ -183,6 +208,7 @@ void IndexCache::add(GlobalAddress address, const InternalNode& node) {
             // Update existing entry in-place (fast path)
             current->node = node;
             current->touch();
+            current->increment_version(); // Increment version to indicate update
             current->valid.store(true, std::memory_order_release);
             return;
         }
@@ -242,12 +268,32 @@ void IndexCache::invalidate_key_range(const Key& key) {
     // Check primary bucket thoroughly
     invalidate_in_bucket(bucket_idx, MAX_CHAIN_LENGTH);
     
-    // Check immediate neighbors with limited search
-    for (int offset = -1; offset <= 1; ++offset) {
+    // For better coverage, check a wider range of buckets since fence ranges
+    // can overlap with different hash buckets due to their range nature
+    for (int offset = -3; offset <= 3; ++offset) {
         if (offset == 0) continue; // Already checked primary bucket
         
         size_t neighbor_idx = (bucket_idx + offset + HASH_TABLE_SIZE) % HASH_TABLE_SIZE;
-        invalidate_in_bucket(neighbor_idx, 4); // Reduced search for neighbors
+        invalidate_in_bucket(neighbor_idx, 4); // Reduced chain length for neighbors
+    }
+    
+    // If we still haven't found many entries, do a broader search
+    // This is important for correctness when fence ranges don't align with hash distribution
+    if (invalidated == 0) {
+        // Sample every 8th bucket for a broader search
+        for (size_t sample_idx = 0; sample_idx < HASH_TABLE_SIZE; sample_idx += 8) {
+            LockFreeCacheEntry* current = hash_table_[sample_idx].load(std::memory_order_acquire);
+            size_t chain_length = 0;
+            
+            while (current != nullptr && chain_length < 2) { // Very limited chain search
+                if (current->is_valid() && current->contains_key(key)) {
+                    current->invalidate();
+                    invalidated++;
+                }
+                current = current->next.load(std::memory_order_acquire);
+                ++chain_length;
+            }
+        }
     }
     
     if (invalidated > 0) {

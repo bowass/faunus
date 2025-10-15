@@ -5,6 +5,7 @@
 #include <unordered_map>
 
 #include "../util/logging.hpp"
+#include "../util/precise_sleep.hpp"
 
 // Private helper to execute mapped RDMA operation
 bool RDMAManager::execute_rdma(RDMAOp& op) {
@@ -85,9 +86,9 @@ std::shared_ptr<MemoryServer> RDMAManager::get_server(const GlobalAddress& gaddr
 
 bool RDMAManager::perform_op(RDMAOp& op) {
     Profiler::Scoped scope("rdma.perform_op");
-    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(base_rtt_us_ / 2)));
+    util::precise_sleep_us(base_rtt_us_ / 2.0);
     bool result = execute_rdma(op);
-    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(base_rtt_us_ / 2)));
+    util::precise_sleep_us(base_rtt_us_ / 2.0);
     auto& stats = ensure_thread_stats();
     stats.op_counts[static_cast<size_t>(op.type)]++; // Simple increment, no atomic needed
     stats.total_rtt_ns++; // Simple increment, no atomic needed
@@ -98,13 +99,13 @@ bool RDMAManager::perform_op(RDMAOp& op) {
 bool RDMAManager::perform_batch(std::vector<RDMAOp*>& ops) {
     Profiler::Scoped scope("rdma.perform_batch");
     LOG_DEBUG("Performing batch of size " << ops.size());
-    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(base_rtt_us_ / 2)));
+    util::precise_sleep_us(base_rtt_us_ / 2.0);
     for (auto* op : ops) {
         if (!execute_rdma(*op)) {
             return false;
         }
     }
-    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(base_rtt_us_ / 2)));
+    util::precise_sleep_us(base_rtt_us_ / 2.0);
     auto& stats = ensure_thread_stats();
     for (auto* op : ops) {
         stats.op_counts[static_cast<size_t>(op->type)]++;
