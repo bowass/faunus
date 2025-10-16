@@ -202,14 +202,15 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Created cache for CS " << cs_id << " targeting level 1");
     }
 
+    auto benchmark_start = std::chrono::steady_clock::now();
     for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
         auto rpc_allocator = std::make_shared<RPCAllocator>(mem_servers);
         auto local_allocator = std::make_shared<LocalAllocator>(sizes, initial_slabs_per_size, rpc_allocator);
-        // auto cache = cs_caches[cs_id];
-        auto cache = nullptr;
+        auto cache = cs_caches[cs_id];
+        // auto cache = nullptr;
 
         auto worker = [cs_id, root_offset_ptr, &op_picker, &worker_summaries, &warmup_counter, &warmup_mutex, &warmup_cv, total_clients,
-                       ops_per_client, warmup_total, &config, cache](int tid, ThreadStats& stat,
+                       ops_per_client, warmup_total, &config, cache, &benchmark_start](int tid, ThreadStats& stat,
                                               std::shared_ptr<RDMAManager> rdma_mgr,
                                               std::shared_ptr<LocalAllocator> allocator) {
             auto kv_index = FaunusIndex(rdma_mgr, allocator, root_offset_ptr, cache);
@@ -296,6 +297,7 @@ int main(int argc, char* argv[]) {
                 if (count == total_clients) {
                     // Last thread to arrive - notify all waiting threads
                     warmup_cv.notify_all();
+                    benchmark_start = std::chrono::steady_clock::now();
                 } else {
                     // Wait for all threads to arrive
                     warmup_cv.wait(lock, [&] { return warmup_counter.load() == total_clients; });
@@ -405,7 +407,6 @@ int main(int argc, char* argv[]) {
         compute_servers.push_back(std::make_shared<ComputeServer>(cs_id, threads_per_cs, rdma_mgr, local_allocator, worker, core_id, config.cpu_isolation_required));
     }
 
-    auto benchmark_start = std::chrono::steady_clock::now();
     for (auto& cs : compute_servers) cs->start();
     for (auto& cs : compute_servers) cs->join();
 
