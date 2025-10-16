@@ -199,39 +199,41 @@ std::string CPUAffinity::get_isolation_recommendations(size_t required_cores) {
 bool CPUAffinity::is_core_busy(size_t core_id) {
 #ifdef __linux__
     // Check /proc/stat for CPU usage
-    std::ifstream stat_file("/proc/stat");
-    if (!stat_file.is_open()) {
-        LOG_WARN("Cannot open /proc/stat to check core usage");
-        return false;  // Assume not busy if we can't check
-    }
+    // std::ifstream stat_file("/proc/stat");
+    // TODO: rmeoved this check
+    // if (!stat_file.is_open()) {
+    //     LOG_WARN("Cannot open /proc/stat to check core usage");
+    //     return false;  // Assume not busy if we can't check
+    // }
     
-    std::string line;
-    std::string target_cpu = "cpu" + std::to_string(core_id);
+    // std::string line;
+    // std::string target_cpu = "cpu" + std::to_string(core_id);
     
-    // Read through /proc/stat to find our specific CPU
-    while (std::getline(stat_file, line)) {
-        if (line.substr(0, target_cpu.length()) == target_cpu && 
-            line.length() > target_cpu.length() && 
-            line[target_cpu.length()] == ' ') {
+    // // Read through /proc/stat to find our specific CPU
+    // while (std::getline(stat_file, line)) {
+    //     if (line.substr(0, target_cpu.length()) == target_cpu && 
+    //         line.length() > target_cpu.length() && 
+    //         line[target_cpu.length()] == ' ') {
             
-            // Parse CPU usage statistics
-            std::istringstream iss(line);
-            std::string cpu_name;
-            long user, nice, system, idle, iowait, irq, softirq, steal;
+    //         // Parse CPU usage statistics
+    //         std::istringstream iss(line);
+    //         std::string cpu_name;
+    //         long user, nice, system, idle, iowait, irq, softirq, steal;
             
-            if (iss >> cpu_name >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal) {
-                long active_time = user + nice + system + irq + softirq + steal;
-                long total_time = active_time + idle + iowait;
+    //         if (iss >> cpu_name >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal) {
+    //             long active_time = user + nice + system + irq + softirq + steal;
+    //             long total_time = active_time + idle + iowait;
                 
-                // Consider core "busy" if more than 5% active (rough heuristic)
-                if (total_time > 0) {
-                    double usage = (double)active_time / total_time;
-                    return usage > 0.05;  // 5% threshold
-                }
-            }
-            break;
-        }
-    }
+    //             // Consider core "busy" if more than 5% active (rough heuristic)
+    //             if (total_time > 0) {
+    //                 double usage = (double)active_time / total_time;
+    //                 LOG_ERROR("Core " << core_id << " usage: " << (usage * 100.0) << "%");
+    //                 return usage > 0.05;  // 5% threshold
+    //             }
+    //         }
+    //         break;
+    //     }
+    // }
     
     // Also check if core is in isolated set
     std::ifstream isolated_file("/sys/devices/system/cpu/isolated");
