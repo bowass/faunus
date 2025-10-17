@@ -230,7 +230,7 @@ private:
     std::vector<std::pair<size_t, KVItem>> get_candidate_kvs(const LeafNode& leaf, const Fingerprint& fp, bool& sucess, bool from_insert=false, bool from_read=false);
 
     FindNodeResult find_node(const Key& key, GlobalAddress& node_address, size_t level = 0, bool from_smo = false);
-    bool handle_local_remove_dupes(const Key& key, GlobalAddress leaf_address, const LeafNode& leaf, bool& found, Value& value_out, bool from_insert=false, bool from_read=false);
+    bool handle_local_remove_dupes(const Key& key, GlobalAddress leaf_address, const LeafNode& leaf, bool& found, Value& value_out, KVBlock new_kvblock=0, bool from_insert=false, bool from_read=false, bool from_update=false);
 
     bool request_smo(FaunusMaintenanceRPC::OpType op, GlobalAddress leaf_address);
 

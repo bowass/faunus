@@ -298,15 +298,17 @@ std::vector<std::pair<size_t, KVItem>> FaunusIndex::get_candidate_kvs(const Leaf
     return candidates;
 }
 
-bool FaunusIndex::handle_local_remove_dupes(const Key& key, GlobalAddress leaf_address, const LeafNode& leaf, bool& found, Value& value_out, bool from_insert/* = false*/, bool from_read/* = false*/) {
+bool FaunusIndex::handle_local_remove_dupes(const Key& key, GlobalAddress leaf_address, const LeafNode& leaf, bool& found, Value& value_out, KVBlock new_kvblock/* = 0*/, bool from_insert/* = false*/, bool from_read/* = false*/, bool from_update/* = false*/) {
     Profiler::Scoped scope("faunus.handle_remove_dupes");
     if (key < leaf.header.fence.first || key >= leaf.header.fence.second) {
         // LOG_DEBUG("Key " << key << " out of fence (" << leaf.header.fence.first << ", " << leaf.header.fence.second << "), fail");
+        // TODO: invalidate cache entries
         return false;
     }
     // readers do not care if leaf is locked
     if (leaf.header.lock && !from_read) {
         // LOG_DEBUG("Leaf is locked, fail");
+        // TODO: invalidate cache entries
         return false;
     }
 
@@ -326,6 +328,25 @@ bool FaunusIndex::handle_local_remove_dupes(const Key& key, GlobalAddress leaf_a
             if (!found) {
                 found = true;
                 value_out = candidate_kvs[i].second.value;
+                if (from_update) {
+                    size_t index = candidate_kvs[i].first;
+                    GlobalAddress kbvlock_address = leaf_address + OFFSET_OF_ARRAY_ELEM(LeafNode, kv_blocks, index);
+                    KVBlock expected_kvb = leaf.kv_blocks[index];
+                    KVBlock tmp_expected_kvb = expected_kvb;
+                    // continue while the fingerprint remained the same - it means that
+                    while (tmp_expected_kvb.getFingerprint() == expected_kvb.getFingerprint()) {
+                        RDMAOp op{RDMAOpType::CAS, kbvlock_address};
+                        op.op.cas.expected = reinterpret_cast<uint64_t>(&tmp_expected_kvb);
+                        op.op.cas.desired = new_kvblock.raw;
+                        assert(rdma_mgr_->perform_op(op));
+                        // if succeeded - good!
+                        if (tmp_expected_kvb == expected_kvb) {
+                            return true;
+                        }   
+                    }
+                    // either SMO or entry was deleted - start from scratch
+                    return false;
+                }
                 // LOG_INFO("Found key " << key << " " << Fingerprint(key) << " in leaf " << leaf_address << " at index " << candidate_kvs[i].first << " with value " << value_out);
             }
             else {
@@ -365,7 +386,7 @@ bool FaunusIndex::read(const Key& key, Value& value_out) {
         // remove duplicate entires
         // returns found entries in found and value_out
         bool found = false;
-        success = handle_local_remove_dupes(key, leaf_address, leaf, found, value_out, false, true);
+        success = handle_local_remove_dupes(key, leaf_address, leaf, found, value_out, 0, false, true, false);
         if (!success) continue; // retry
         return found;
     }
@@ -557,7 +578,7 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         else {
             bool found = false;
             Value dummy;
-            handle_local_remove_dupes(key, leaf_address, leaf, found, dummy, true, false);
+            handle_local_remove_dupes(key, leaf_address, leaf, found, dummy, 0, true, false, false);
             return true;
         }
     }
@@ -567,7 +588,52 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
 }
 
 bool FaunusIndex::update(const Key& key, const Value& value) {
-    return false;
+    GlobalAddress leaf_address;
+    bool success;
+    bool wrote_kvitem = false;
+    GlobalAddress kvitem_address = allocator_->allocate(sizeof(KVItem));
+    KVItem kvitem{key, value};
+    KVBlock kvb{Fingerprint(key), kvitem_address, false, false};
+    LeafNode leaf;
+    for (size_t attempt = 0; attempt < 1000000; attempt++) {
+        // find leaf address
+        auto find_result = find_node(key, leaf_address);
+        assert(find_result != FindNodeResult::UNKNOWN && find_result != FindNodeResult::NO_SUCH_LEVEL);
+        if (find_result != FindNodeResult::FOUND) continue; // retry
+
+        // TODO: unlike the paper, here we write the leaf while reading the node - like in insert
+        // read leaf and write KVItem if needed
+        std::vector<RDMAOp> ops;
+        // read leafkvitem_address
+        ops.push_back(RDMAOp{RDMAOpType::READ, leaf_address});
+        ops.back().op.read.buffer = reinterpret_cast<uint8_t*>(&leaf);
+        ops.back().op.read.bytes = sizeof(LeafNode);
+
+        // write KVItem to already allocated space
+        if (!wrote_kvitem) {
+            ops.push_back(RDMAOp{RDMAOpType::WRITE, kvitem_address});
+            ops.back().op.write.buffer = reinterpret_cast<uint8_t*>(&kvitem);
+            ops.back().op.write.bytes = sizeof(KVItem);
+            wrote_kvitem = true;
+        }
+
+        {
+            Profiler::Scoped scope("faunus.update.perform_batch");
+            assert(rdma_mgr_->perform_batch(ops));
+        }
+        assert(leaf.header.level == 0);
+
+        // remove duplicate entires
+        // updates first found entry with CAs in a loop
+        bool found = false;
+        Value dummy_value;
+        success = handle_local_remove_dupes(key, leaf_address, leaf, found, dummy_value, kvb, false, false, true);
+        if (!success) continue; // retry
+        return found;
+    }
+    // deadlock???
+    assert(false);
+    return false;    
 }
 
 bool FaunusIndex::del(const Key& key) {
