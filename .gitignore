@@ -28,3 +28,5 @@ results/
 output/
 benchmark_results/
 profiling_results/
+.profile_venv/
+*.perf

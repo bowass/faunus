@@ -55,7 +55,7 @@ public:
      * @brief Perform a batch of RDMA operations using the global address in each RDMAOp.
      * @param ops Vector of RDMAOp references
      */
-    bool perform_batch(std::vector<RDMAOp*>& ops);
+    bool perform_batch(std::vector<RDMAOp>& ops);
     RDMAStats collect_stats() const;
     void reset_stats();
     /**
@@ -108,13 +108,12 @@ bool rdma_write_object(RDMAManager& rdma_mgr, GlobalAddress gaddr, const T& obj)
 template<typename T>
 bool rdma_read_batch(RDMAManager& rdma_mgr, std::vector<GlobalAddress> gaddrs, std::vector<T>& objs) {
     Profiler::Scoped scope("rdma.read_batch");
-    std::vector<RDMAOp*> ops;
+    std::vector<RDMAOp> ops;
     objs.resize(gaddrs.size());
     for (size_t i = 0; i < gaddrs.size(); ++i) {
-        RDMAOp* op = new RDMAOp{RDMAOpType::READ, gaddrs[i]};
-        op->op.read.buffer = reinterpret_cast<uint8_t*>(&objs[i]);
-        op->op.read.bytes = sizeof(T);
-        ops.push_back(op);
+        ops.push_back(RDMAOp{RDMAOpType::READ, gaddrs[i]});
+        ops.back().op.read.buffer = reinterpret_cast<uint8_t*>(&objs[i]);
+        ops.back().op.read.bytes = sizeof(T);
     }
     return rdma_mgr.perform_batch(ops);
 }

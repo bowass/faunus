@@ -41,11 +41,11 @@ public:
         int64_t offset = get_free_slab_nolock();
         if (offset != -1) return offset;
         // No free slab, grow
-        LOG_DEBUG("[SlabAllocator] Growing slab for size " << slab_size_ << " by " << num_slabs_);
+        // LOG_DEBUG("[SlabAllocator] Growing slab for size " << slab_size_ << " by " << num_slabs_);
         get_slabs_nolock(num_slabs_);
         offset = get_free_slab_nolock();
         if (offset == -1) {
-            LOG_DEBUG("[SlabAllocator] Still failed to allocate after growth for size " << slab_size_);
+            // LOG_DEBUG("[SlabAllocator] Still failed to allocate after growth for size " << slab_size_);
         }
         return offset;
     }
@@ -98,23 +98,23 @@ public:
     LocalAllocator(const std::set<size_t>& sizes, size_t num_chunks_per_slab, std::shared_ptr<Allocator> allocator)
         : allocator_(allocator) {
         for (auto sz : sizes) {
-            LOG_DEBUG("Creating slab for size " << sz << " at " << this);
+            // LOG_DEBUG("Creating slab for size " << sz << " at " << this);
             slabs_[sz] = std::make_unique<SlabAllocator>(sz, num_chunks_per_slab, allocator);
         }
     }
     // Thread-safe allocation for a given size
     // TODO: is map thread-safe? are the allocate() and free() in SlabAllocator thread-safe?
     int64_t allocate(size_t size) {
-        LOG_DEBUG("Slabs at " << this);
+        // LOG_DEBUG("Slabs at " << this);
         auto it = slabs_.find(size);
         if (it == slabs_.end()) {
-            LOG_ERROR("[LocalAllocator] No slab for size " << size);
+            // LOG_ERROR("[LocalAllocator] No slab for size " << size);
             return -1;
         }
-        LOG_DEBUG("[LocalAllocator] Allocating size " << size);
+        // LOG_DEBUG("[LocalAllocator] Allocating size " << size);
         int64_t result = it->second->allocate();
         if (result == -1) {
-            LOG_ERROR("[LocalAllocator] Allocation failed for size " << size);
+            // LOG_ERROR("[LocalAllocator] Allocation failed for size " << size);
         }
         return result;
     }

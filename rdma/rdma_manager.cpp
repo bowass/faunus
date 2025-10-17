@@ -10,7 +10,7 @@
 // Private helper to execute mapped RDMA operation
 bool RDMAManager::execute_rdma(RDMAOp& op) {
     Profiler::Scoped scope("rdma.execute");
-    LOG_DEBUG("Executing RDMA operation: type=" << static_cast<int>(op.type) << ", gaddr=" << std::hex << static_cast<GlobalAddress>(op.addr).raw << std::dec);
+    // LOG_DEBUG("Executing RDMA operation: type=" << static_cast<int>(op.type) << ", gaddr=" << std::hex << static_cast<GlobalAddress>(op.addr).raw << std::dec);
     size_t local_addr;
     auto server = get_server(op.addr, local_addr);
     if (!server) return false;
@@ -96,19 +96,19 @@ bool RDMAManager::perform_op(RDMAOp& op) {
 }
 
 
-bool RDMAManager::perform_batch(std::vector<RDMAOp*>& ops) {
+bool RDMAManager::perform_batch(std::vector<RDMAOp>& ops) {
     Profiler::Scoped scope("rdma.perform_batch");
-    LOG_DEBUG("Performing batch of size " << ops.size());
+    // LOG_DEBUG("Performing batch of size " << ops.size());
     util::precise_sleep_us(base_rtt_us_ / 2.0);
-    for (auto* op : ops) {
-        if (!execute_rdma(*op)) {
+    for (auto op : ops) {
+        if (!execute_rdma(op)) {
             return false;
         }
     }
     util::precise_sleep_us(base_rtt_us_ / 2.0);
     auto& stats = ensure_thread_stats();
-    for (auto* op : ops) {
-        stats.op_counts[static_cast<size_t>(op->type)]++;
+    for (auto op : ops) {
+        stats.op_counts[static_cast<size_t>(op.type)]++;
         stats.total_rtt_ns++;
     }
     return true;

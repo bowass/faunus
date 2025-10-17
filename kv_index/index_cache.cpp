@@ -28,7 +28,7 @@ IndexCache::IndexCache(size_t max_entries, size_t target_level)
         bucket.store(nullptr, std::memory_order_relaxed);
     }
     
-    LOG_INFO("Lock-free IndexCache created with max_entries=" << max_entries_ << ", target_level=" << target_level_);
+    // LOG_INFO("Lock-free IndexCache created with max_entries=" << max_entries_ << ", target_level=" << target_level_);
 }
 
 IndexCache::~IndexCache() {
