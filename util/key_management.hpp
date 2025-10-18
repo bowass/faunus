@@ -6,7 +6,7 @@
 #include "../kv_index/kv_index.hpp"
 #include "../util/profiler.hpp"
 
-namespace faunus_util {
+namespace util {
 
 /**
  * Manages a local set of keys with efficient slot-based storage and reuse.
@@ -104,4 +104,4 @@ inline Value generate_random_value(std::mt19937_64& gen) {
     return value;
 }
 
-} // namespace faunus_util
+} // namespace util

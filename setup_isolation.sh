@@ -1,7 +1,7 @@
 #!/bin/bash
 
 echo "============================================"
-echo "CPU Core Isolation Setup for Faunus RDMA"
+echo "CPU Core Isolation Setup for RDMA Simulation"
 echo "============================================"
 echo
 

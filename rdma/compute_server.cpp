@@ -10,7 +10,7 @@ ComputeServer::ComputeServer(int id, int num_threads, std::shared_ptr<RDMAManage
 void ComputeServer::start() {
     for (int i = 0; i < num_threads_; ++i) {
         workers_.emplace_back([this, i]() {
-            faunus_log::setup_thread_log();
+            thread_log::setup_thread_log();
             
             // Bind to CPU core if specified
             if (core_id_.has_value()) {
@@ -33,7 +33,7 @@ void ComputeServer::start() {
             }
             
             worker_(i, stats_[i], rdma_mgr_, allocator_);
-            faunus_log::close_thread_log();
+            thread_log::close_thread_log();
         });
     }
 }

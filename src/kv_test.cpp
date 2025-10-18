@@ -22,9 +22,11 @@
 #include "../rdma/memory_server.hpp"
 #include "../rdma/rpc_allocator.hpp"
 #include "../rdma/compute_server.hpp"
-#include "../config/faunus_config.hpp"
+#include "../config/config.hpp"
 #include "../kv_index/faunus_index.hpp"
 #include "../kv_index/index_cache.hpp"
+// #include "../kv_index/sherman_index.hpp"
+#include "../kv_index/fg_index.hpp"
 #include "../util/profiler.hpp"
 #include "../util/distribution.hpp"
 #include "../util/key_management.hpp"
@@ -35,19 +37,32 @@
 
 int main(int argc, char* argv[]) {
     // Setup thread log directory (delete previous logs)
-    faunus_log::setup_log_dir();
+    thread_log::setup_log_dir();
 
-    std::string config_path = "faunus_config.yaml";
+    std::string config_path = "config.yaml";
     if (argc > 1) config_path = argv[1];
     // Load configuration from YAML file
-    FaunusConfig config = load_faunus_config(config_path);
+    IndexConfig config = load_config(config_path);
     const size_t num_ms = config.num_ms;
     const size_t mem_per_server = config.mem_per_ms;
     const double base_rtt_us = config.base_rtt_us;
 
     set_log_level(config.log_level);
-    faunus_log::setup_thread_log();
+    thread_log::setup_thread_log();
     Profiler::reset();
+
+    // Small factory to create KVIndex implementations based on config.index
+    auto make_index = [&config](std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer, std::shared_ptr<faunus_index_internal::IndexCache> cache) -> std::unique_ptr<KVIndex> {
+        switch (config.index_type) {
+            case IndexConfig::IndexType::Faunus:
+                return std::make_unique<FaunusIndex>(rdma_mgr, allocator, root_offset_pointer, cache);
+            // case IndexConfig::IndexType::Sherman:
+                // return std::make_unique<ShermanIndex>(rdma_mgr, allocator, root_offset_pointer, cache);
+            default:
+                LOG_WARN("Unhandled index type - defaulting to FaunusIndex");
+                return std::make_unique<FaunusIndex>(rdma_mgr, allocator, root_offset_pointer, cache);
+        }
+    };
     
     // Validate CPU binding configuration
     if (config.cpu_binding_enabled) {
@@ -124,9 +139,10 @@ int main(int argc, char* argv[]) {
         auto rpc_allocator = std::make_shared<RPCAllocator>(mem_servers);
         auto local_allocator = std::make_shared<LocalAllocator>(sizes, initial_slabs_per_size, rpc_allocator);
 
-        FaunusIndex init_index(rdma_mgr, local_allocator, 0, nullptr);
-        init_index.initialize();
-        root_offset_ptr = init_index.get_root_offset_pointer();
+        auto init_index = make_index(rdma_mgr, local_allocator, 0, nullptr);
+        init_index->initialize(num_maintenance_cs);
+        // KVIndex::get_root_offset_pointer() is part of the KVIndex interface — call directly
+        root_offset_ptr = init_index->get_root_offset_pointer();
         LOG_INFO("Initialized FaunusIndex with root at global address " << std::hex << root_offset_ptr << std::dec);
     }
 
@@ -148,9 +164,10 @@ int main(int argc, char* argv[]) {
         // auto cache = mcs_caches[mcs_id];
         auto cache = nullptr;
 
-        auto maintenance_worker = [mcs_id, root_offset_ptr, cache](size_t tid, ThreadStats& stat, std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator) {
-            FaunusIndex index(rdma_mgr, allocator, root_offset_ptr, cache);
-            index.maintenance_worker(mcs_id, tid);
+        auto maintenance_worker = [mcs_id, root_offset_ptr, cache, &make_index](size_t tid, ThreadStats& stat, std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator) {
+            auto index = make_index(rdma_mgr, allocator, root_offset_ptr, cache);
+            // if the index implementation provides a maintenance_worker override, call it
+            index->maintenance_worker(mcs_id, tid);
         };
         
         // CPU binding for maintenance CS: they get cores after the main CS
@@ -162,21 +179,15 @@ int main(int argc, char* argv[]) {
         maintenance_compute_servers.push_back(std::make_shared<ComputeServer>(mcs_id, threads_per_maintenance_cs, rdma_mgr, local_allocator, maintenance_worker, mcs_core, config.cpu_isolation_required));
     }
 
-    // Use queued-sets to prevent duplicate maintenance requests (more efficient)
-    if (num_maintenance_cs > 0) {
-        FaunusIndex::set_maintenance_queued_sets(FaunusIndex::create_maintenance_queued_sets(num_maintenance_cs));
-        // FaunusIndex::set_maintenance_queues(FaunusIndex::create_maintenance_queues(num_maintenance_cs));
-        LOG_INFO("Using maintenance queued-sets (prevents duplicate SMO requests) for " << num_maintenance_cs << " maintenance servers");
-    }
     for (auto& mcs : maintenance_compute_servers) mcs->start();
     
     // Removed redundant atomic counters to eliminate unnecessary thread synchronization:
     // These were causing performance overhead without providing useful functionality
     // since operation counts are already tracked per-thread in ThreadStats
     
-    std::vector<std::vector<faunus_util::WorkerSummary>> worker_summaries(num_cs, std::vector<faunus_util::WorkerSummary>(threads_per_cs));
+    std::vector<std::vector<util::WorkerSummary>> worker_summaries(num_cs, std::vector<util::WorkerSummary>(threads_per_cs));
 
-    faunus_util::OperationPicker op_picker(config.operation_mix);
+    util::OperationPicker op_picker(config.operation_mix);
 
     const std::filesystem::path stats_dir("thread_stats");
     if (std::filesystem::exists(stats_dir)) {
@@ -206,14 +217,14 @@ int main(int argc, char* argv[]) {
     for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
         auto rpc_allocator = std::make_shared<RPCAllocator>(mem_servers);
         auto local_allocator = std::make_shared<LocalAllocator>(sizes, initial_slabs_per_size, rpc_allocator);
-        auto cache = cs_caches[cs_id];
-        // auto cache = nullptr;
+        // auto cache = cs_caches[cs_id];
+        auto cache = nullptr;
 
         auto worker = [cs_id, root_offset_ptr, &op_picker, &worker_summaries, &warmup_counter, &warmup_mutex, &warmup_cv, total_clients,
-                       ops_per_client, warmup_total, &config, cache, &benchmark_start](int tid, ThreadStats& stat,
+                       ops_per_client, warmup_total, &config, cache, &benchmark_start, &make_index](int tid, ThreadStats& stat,
                                               std::shared_ptr<RDMAManager> rdma_mgr,
                                               std::shared_ptr<LocalAllocator> allocator) {
-            auto kv_index = FaunusIndex(rdma_mgr, allocator, root_offset_ptr, cache);
+            auto kv_index = make_index(rdma_mgr, allocator, root_offset_ptr, cache);
             const size_t global_client_id = static_cast<size_t>(cs_id) * config.threads_per_cs + static_cast<size_t>(tid);
             const size_t warmup_per_client = warmup_total / total_clients + (global_client_id < (warmup_total % total_clients) ? 1 : 0);
 
@@ -221,14 +232,14 @@ int main(int argc, char* argv[]) {
             std::mt19937_64 value_rng(std::random_device{}() ^ (static_cast<uint64_t>(global_client_id) << 16));
             auto& summary = worker_summaries[cs_id][tid];
 
-            faunus_util::KeySelectionSampler sampler(config.distribution);
-            faunus_util::LocalKeySet key_set(config.distribution.key_space);
-            faunus_util::OperationRecorder recorder(stat);
+            util::KeySelectionSampler sampler(config.distribution);
+            util::LocalKeySet key_set(config.distribution.key_space);
+            util::OperationRecorder recorder(stat);
             uint64_t sequence = 0;
 
             auto perform_insert = [&](const Key& key, const Value& value, bool update_local_state) {
                 auto start = std::chrono::high_resolution_clock::now();
-                bool ok = kv_index.insert(key, value);
+                bool ok = kv_index->insert(key, value);
                 auto end = std::chrono::high_resolution_clock::now();
                 recorder.record_result(OperationKind::Insert, start, end, ok);
                 if (ok) {
@@ -246,16 +257,16 @@ int main(int argc, char* argv[]) {
             auto perform_read = [&](const Key& key) {
                 Value val{};
                 auto start = std::chrono::high_resolution_clock::now();
-                bool ok = kv_index.read(key, val);
+                bool ok = kv_index->read(key, val);
                 auto end = std::chrono::high_resolution_clock::now();
                 recorder.record_result(OperationKind::Read, start, end, ok);
                 return ok;
             };
 
             auto perform_update = [&](const Key& key) {
-                Value new_value = faunus_util::generate_random_value(value_rng);
+                Value new_value = util::generate_random_value(value_rng);
                 auto start = std::chrono::high_resolution_clock::now();
-                bool ok = kv_index.update(key, new_value);
+                bool ok = kv_index->update(key, new_value);
                 auto end = std::chrono::high_resolution_clock::now();
                 recorder.record_result(OperationKind::Update, start, end, ok);
                 return ok;
@@ -263,7 +274,7 @@ int main(int argc, char* argv[]) {
 
             auto perform_delete = [&](size_t slot, const Key& key) {
                 auto start = std::chrono::high_resolution_clock::now();
-                bool ok = kv_index.del(key);
+                bool ok = kv_index->del(key);
                 auto end = std::chrono::high_resolution_clock::now();
                 recorder.record_result(OperationKind::Delete, start, end, ok);
                 if (ok) {
@@ -276,8 +287,8 @@ int main(int argc, char* argv[]) {
             // Warm-up inserts specific to this client
             for (size_t i = 0; i < warmup_per_client; ++i) {
                 if (!key_set.can_insert()) break;
-                Key key = faunus_util::encode_key(global_client_id, sequence++);
-                Value value = faunus_util::generate_random_value(value_rng);
+                Key key = util::encode_key(global_client_id, sequence++);
+                Value value = util::generate_random_value(value_rng);
                 bool inserted = perform_insert(key, value, true);
                 if (!inserted) {
                     // Stop warmup if insert fails consistently
@@ -343,8 +354,8 @@ int main(int argc, char* argv[]) {
                 bool success = false;
                 switch (actual) {
                     case OperationKind::Insert: {
-                        Key key = faunus_util::encode_key(global_client_id, sequence++);
-                        Value value = faunus_util::generate_random_value(value_rng);
+                        Key key = util::encode_key(global_client_id, sequence++);
+                        Value value = util::generate_random_value(value_rng);
                         success = perform_insert(key, value, true);
                         break;
                     }
@@ -410,9 +421,10 @@ int main(int argc, char* argv[]) {
     for (auto& cs : compute_servers) cs->start();
     for (auto& cs : compute_servers) cs->join();
 
-    if (num_maintenance_cs > 0 && threads_per_maintenance_cs > 0) {
-        FaunusIndex::stop_maintenance(threads_per_maintenance_cs);
-    }
+    // Finalize by creating a dummy index of the configured type and calling finalize
+    auto dummy_index = make_index(nullptr, nullptr, 0, nullptr);
+    dummy_index->finalize(threads_per_maintenance_cs);
+
     for (auto& mcs : maintenance_compute_servers) mcs->join();
 
     auto benchmark_end = std::chrono::steady_clock::now();
@@ -546,9 +558,9 @@ int main(int argc, char* argv[]) {
     }
 
     // Optionally print per-thread latency stats
-    // Using faunus_util::operation_name instead of local lambda
+    // Using util::operation_name instead of local lambda
 
-    std::array<faunus_util::AggregatedOpStats, static_cast<size_t>(OperationKind::Count)> op_totals{};
+    std::array<util::AggregatedOpStats, static_cast<size_t>(OperationKind::Count)> op_totals{};
     
     // Collect all latency samples for percentile calculation
     std::array<std::vector<double>, static_cast<size_t>(OperationKind::Count)> all_samples;
@@ -587,7 +599,7 @@ int main(int argc, char* argv[]) {
             json_out << "  \"operations\": {\n";
             for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
                 const auto& entry = thread_stat.per_op[op_idx];
-                json_out << "    \"" << faunus_util::operation_name(op_idx) << "\": {\n";
+                json_out << "    \"" << util::operation_name(op_idx) << "\": {\n";
                 json_out << "      \"successes\": " << entry.successes << ",\n";
                 json_out << "      \"failures\": " << entry.failures << ",\n";
                 json_out << "      \"avg_latency_us\": ";
@@ -616,7 +628,7 @@ int main(int argc, char* argv[]) {
                 // Calculate percentiles for this thread
                 auto thread_samples = entry.latency_samples.get_samples();
                 if (!thread_samples.empty()) {
-                    auto [p50, p95, p99] = faunus_util::PercentileCalculator::calculate_standard(thread_samples);
+                    auto [p50, p95, p99] = util::PercentileCalculator::calculate_standard(thread_samples);
                     json_out << "      \"p50_latency_us\": " << p50 << ",\n";
                     json_out << "      \"p95_latency_us\": " << p95 << ",\n";
                     json_out << "      \"p99_latency_us\": " << p99 << ",\n";
@@ -654,7 +666,7 @@ int main(int argc, char* argv[]) {
         auto& samples = all_samples[op_idx];
         
         if (!samples.empty()) {
-            auto [p50, p95, p99] = faunus_util::PercentileCalculator::calculate_standard(samples);
+            auto [p50, p95, p99] = util::PercentileCalculator::calculate_standard(samples);
             agg_entry.p50_latency_us = p50;
             agg_entry.p95_latency_us = p95;
             agg_entry.p99_latency_us = p99;
@@ -695,7 +707,7 @@ int main(int argc, char* argv[]) {
         summary_out << "  \"per_operation_latency\": {\n";
         for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
             const auto& agg = op_totals[op_idx];
-            summary_out << "    \"" << faunus_util::operation_name(op_idx) << "\": {\n";
+            summary_out << "    \"" << util::operation_name(op_idx) << "\": {\n";
             summary_out << "      \"successes\": " << agg.successes << ",\n";
             summary_out << "      \"failures\": " << agg.failures << ",\n";
             summary_out << "      \"avg_latency_us\": ";
@@ -838,6 +850,6 @@ int main(int argc, char* argv[]) {
     }
 
     // At program end, close thread log
-    faunus_log::close_thread_log();
+    thread_log::close_thread_log();
     return 0;
 }

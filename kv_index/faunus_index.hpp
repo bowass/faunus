@@ -184,7 +184,6 @@ namespace faunus_index_internal {
  * Faunus
  */
 class FaunusIndex : public KVIndex {
-    class RDMALockGuard;
 public:
     FaunusIndex(std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer = 0, std::shared_ptr<faunus_index_internal::IndexCache> cache = nullptr);
     bool insert(const Key& key, const Value& value);
@@ -195,21 +194,9 @@ public:
     // Optional maintenance worker: processes RPCs from a per-CS queue
     void maintenance_worker(size_t thread_id, size_t cs_id);
 
-    // Set/get helpers for per-CS maintenance queues (legacy)
-    static std::vector<std::shared_ptr<FaunusMaintenanceQueue>> create_maintenance_queues(size_t num_queues);
-    static void set_maintenance_queues(const std::vector<std::shared_ptr<FaunusMaintenanceQueue>>& queues);
-    static std::shared_ptr<FaunusMaintenanceQueue> get_maintenance_queue(size_t cs_id);
-    static void stop_maintenance(size_t threads_per_queue);
-    static size_t num_maintenance_queues();
-    
-    // Set/get helpers for per-CS maintenance queued-sets (new, prevents duplicates)
-    static std::vector<std::shared_ptr<FaunusMaintenanceQueuedSet>> create_maintenance_queued_sets(size_t num_queues);
-    static void set_maintenance_queued_sets(const std::vector<std::shared_ptr<FaunusMaintenanceQueuedSet>>& queued_sets);
-    static std::shared_ptr<FaunusMaintenanceQueuedSet> get_maintenance_queued_set(size_t cs_id);
-    static void stop_maintenance_queued_sets(size_t threads_per_queue);
-    static size_t num_maintenance_queued_sets();
+    bool initialize(size_t num_maintenance_queues=0);
+    bool finalize(size_t num_maintenance_threads_per_queue=0);
 
-    bool initialize();
     GlobalAddress get_root_offset_pointer() const;
     static std::set<size_t> get_required_sizes();
     // Print the entire tree from root
@@ -222,6 +209,21 @@ private:
 
     static std::vector<std::shared_ptr<FaunusMaintenanceQueue>> s_faunus_maintenance_queues;
     static std::vector<std::shared_ptr<FaunusMaintenanceQueuedSet>> s_faunus_maintenance_queued_sets;
+
+    // Set/get helpers for per-CS maintenance queues (legacy)
+    // TODO: get rid of that?
+    static std::vector<std::shared_ptr<FaunusMaintenanceQueue>> create_maintenance_queues(size_t num_queues);
+    static void set_maintenance_queues(const std::vector<std::shared_ptr<FaunusMaintenanceQueue>>& queues);
+    static std::shared_ptr<FaunusMaintenanceQueue> get_maintenance_queue(size_t cs_id);
+    static void stop_maintenance(size_t threads_per_queue);
+    static size_t num_maintenance_queues();
+    
+    // Set/get helpers for per-CS maintenance queued-sets (new, prevents duplicates)
+    static std::vector<std::shared_ptr<FaunusMaintenanceQueuedSet>> create_maintenance_queued_sets(size_t num_queues);
+    static void set_maintenance_queued_sets(const std::vector<std::shared_ptr<FaunusMaintenanceQueuedSet>>& queued_sets);
+    static std::shared_ptr<FaunusMaintenanceQueuedSet> get_maintenance_queued_set(size_t cs_id);
+    static void stop_maintenance_queued_sets(size_t threads_per_queue);
+    static size_t num_maintenance_queued_sets();
 
     GlobalAddress get_root_offset() const;
     GlobalAddress update_root_offset(GlobalAddress new_root_offset);

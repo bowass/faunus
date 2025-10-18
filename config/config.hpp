@@ -34,7 +34,7 @@ struct DistributionConfig {
     }
 };
 
-struct FaunusConfig {
+struct IndexConfig {
     size_t num_cs = 8;
     size_t threads_per_cs = 8;
     size_t num_ms = 8;
@@ -45,7 +45,7 @@ struct FaunusConfig {
     size_t value_size = 8;
     size_t kv_per_thread = 1000;
     size_t initial_slabs_per_size = 1024;
-    faunus_log::LogLevel log_level = faunus_log::LOG_INFO;
+    thread_log::LogLevel log_level = thread_log::LOG_INFO;
     // CPU affinity configuration
     bool cpu_binding_enabled = false;
     size_t cpu_binding_start_core = 0;  // First core to use for CS binding
@@ -58,11 +58,16 @@ struct FaunusConfig {
     size_t warmup_inserts = 1000;
     std::array<double, 4> operation_mix = {0.5, 0.3, 0.1, 0.1}; // insert, read, update, delete
     std::string workload;
+    // Index implementation to use: enum for safe/fast selection in code
+    enum class IndexType { Faunus, Sherman };
+    IndexType index_type = IndexType::Faunus;
+    // Keep the raw name for informational/logging purposes
+    std::string index = "faunus";
     DistributionConfig distribution;
 };
 
-inline FaunusConfig load_faunus_config(const std::string& yaml_path) {
-    FaunusConfig cfg;
+inline IndexConfig load_config(const std::string& yaml_path) {
+    IndexConfig cfg;
     YAML::Node node = YAML::LoadFile(yaml_path);
     if (node["num_cs"]) cfg.num_cs = node["num_cs"].as<size_t>();
     if (node["threads_per_cs"]) cfg.threads_per_cs = node["threads_per_cs"].as<size_t>();
@@ -74,7 +79,7 @@ inline FaunusConfig load_faunus_config(const std::string& yaml_path) {
     if (node["value_size"]) cfg.value_size = node["value_size"].as<size_t>();
     if (node["kv_per_thread"]) cfg.kv_per_thread = node["kv_per_thread"].as<size_t>();
     if (node["initial_slabs_per_size"]) cfg.initial_slabs_per_size = node["initial_slabs_per_size"].as<size_t>();
-    if (node["log_level"]) cfg.log_level = faunus_log::log_level_from_string(node["log_level"].as<std::string>());
+    if (node["log_level"]) cfg.log_level = thread_log::log_level_from_string(node["log_level"].as<std::string>());
     if (node["cpu_binding_enabled"]) cfg.cpu_binding_enabled = node["cpu_binding_enabled"].as<bool>();
     if (node["cpu_binding_start_core"]) cfg.cpu_binding_start_core = node["cpu_binding_start_core"].as<size_t>();
     if (node["cpu_isolation_required"]) cfg.cpu_isolation_required = node["cpu_isolation_required"].as<bool>();
@@ -85,6 +90,15 @@ inline FaunusConfig load_faunus_config(const std::string& yaml_path) {
     if (node["warmup_inserts"]) cfg.warmup_inserts = node["warmup_inserts"].as<size_t>();
     if (node["workload"]) cfg.workload = node["workload"].as<std::string>();
     else if (node["ycsb_workload"]) cfg.workload = node["ycsb_workload"].as<std::string>();
+
+    if (node["index"]) {
+        std::string raw = node["index"].as<std::string>();
+        // normalize to lowercase
+        std::transform(raw.begin(), raw.end(), raw.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        cfg.index = raw;
+        if (raw == "sherman") cfg.index_type = IndexConfig::IndexType::Sherman;
+        else cfg.index_type = IndexConfig::IndexType::Faunus;
+    }
 
     if (!cfg.workload.empty()) {
         static const std::map<std::string, std::array<double, 4>> ycsb_presets = {

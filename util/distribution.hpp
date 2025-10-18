@@ -4,9 +4,9 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
-#include "../config/faunus_config.hpp"
+#include "../config/config.hpp"
 
-namespace faunus_util {
+namespace util {
 
 /**
  * Zipfian (skewed) distribution sampler implementing the algorithm from
@@ -176,4 +176,4 @@ private:
     UniformSampler uniform_sampler_;
 };
 
-} // namespace faunus_util
+} // namespace util

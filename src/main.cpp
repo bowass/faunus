@@ -6,14 +6,14 @@
 #include "../rdma/memory_server.hpp"
 #include "../rdma/rdma_manager.hpp"
 #include "../rdma/rpc_allocator.hpp"
-#include "../config/faunus_config.hpp"
+#include "../config/config.hpp"
 #include "../kv_index/kv_index_rdma.hpp"
 
 int main(int argc, char* argv[]) {
-    std::string config_path = "faunus_config.yaml";
+    std::string config_path = "config.yaml";
     if (argc > 1) config_path = argv[1];
     // Load configuration from YAML file
-    FaunusConfig config = load_faunus_config(config_path);
+    IndexConfig config = load_config(config_path);
 
     const int threads_per_cs = config.threads_per_cs;
     const int num_cs = config.num_cs;

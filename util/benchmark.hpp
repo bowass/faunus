@@ -8,9 +8,9 @@
 #include <algorithm>
 #include <tuple>
 #include "../rdma/compute_server.hpp"
-#include "../config/faunus_config.hpp"
+#include "../config/config.hpp"
 
-namespace faunus_util {
+namespace util {
 
 /**
  * Summary statistics for a worker thread's performance.
@@ -152,4 +152,4 @@ public:
     }
 };
 
-} // namespace faunus_util
+} // namespace util

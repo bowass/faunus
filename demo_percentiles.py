@@ -6,20 +6,19 @@ from pathlib import Path
 
 def demonstrate_percentiles():
     """Show the enhanced statistics with percentiles."""
-    print("🎯 Enhanced Faunus Statistics with Percentiles")
     print("=" * 50)
     
     # Load summary statistics
     summary_path = Path("thread_stats/summary.json")
     if not summary_path.exists():
-        print("❌ No statistics found. Run kv_test first.")
+        print("No statistics found. Run kv_test first.")
         return
     
     with summary_path.open() as f:
         summary = json.load(f)
     
     # Display global summary
-    print(f"📊 Global Summary:")
+    print(f"Global Summary:")
     print(f"   Total operations: {summary.get('total_attempted', 0):,}")
     print(f"   Success rate: {summary.get('total_succeeded', 0)/summary.get('total_attempted', 1)*100:.1f}%")
     print(f"   Duration: {summary.get('elapsed_sec', 0):.2f}s")
@@ -27,8 +26,8 @@ def demonstrate_percentiles():
     
     # Display enhanced per-operation latency statistics
     per_op_latency = summary.get("per_operation_latency", {})
-    
-    print("📈 Per-Operation Latency Statistics (microseconds):")
+
+    print("Per-Operation Latency Statistics (microseconds):")
     print("-" * 80)
     print(f"{'Operation':<10} {'Count':<8} {'Avg':<8} {'P50':<8} {'P95':<8} {'P99':<8} {'Samples':<8}")
     print("-" * 80)
@@ -48,7 +47,7 @@ def demonstrate_percentiles():
     print()
     
     # Display per-thread breakdown for the first few threads
-    print("🧵 Per-Thread Percentile Analysis:")
+    print("Per-Thread Percentile Analysis:")
     print("-" * 60)
     
     thread_files = sorted(Path("thread_stats").glob("cs_*_thread_*.json"))[:4]  # Show first 4 threads
@@ -74,12 +73,12 @@ def demonstrate_percentiles():
         print()
     
     # Show visualization files generated
-    print("🎨 Generated Visualization Files:")
-    viz_files = list(Path("thread_stats").glob("faunus_*.png"))
+    print("Generated Visualization Files:")
+    viz_files = list(Path("thread_stats").glob("*.png"))
     for viz_file in sorted(viz_files):
-        print(f"   📊 {viz_file.name}")
-    
-    print(f"\n✅ Enhanced statistics successfully demonstrated!")
+        print(f"   {viz_file.name}")
+
+    print(f"\nEnhanced statistics successfully demonstrated!")
     print(f"   • Efficient per-thread latency sampling (max 10,000 samples per operation)")
     print(f"   • Accurate P50, P95, P99 percentile calculation across all clients") 
     print(f"   • Enhanced JSON output with percentile data")

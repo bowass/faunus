@@ -24,7 +24,7 @@ FaunusIndex::FaunusIndex(std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<
     // LOG_DEBUG("FaunusIndex created with cache: " << (cache_ ? "enabled" : "disabled"));
 }
 
-bool FaunusIndex::initialize() {
+bool FaunusIndex::initialize(size_t num_maintenance_queues) {
     root_offset_pointer_ = allocator_->allocate(sizeof(GlobalAddress));
     GlobalAddress root_offset = allocator_->allocate(sizeof(LeafNode));
     bool success;
@@ -40,7 +40,18 @@ bool FaunusIndex::initialize() {
 
     success = update_root_offset(root_offset);
 
+    // initialize maintenance
+    if (num_maintenance_queues > 0) {
+        set_maintenance_queued_sets(create_maintenance_queued_sets(num_maintenance_queues));
+        // FaunusIndex::set_maintenance_queues(FaunusIndex::create_maintenance_queues(num_maintenance_cs));
+        // LOG_INFO("Using maintenance queued-sets (prevents duplicate SMO requests) for " << num_maintenance_cs << " maintenance servers");
+    }
     return success;
+}
+
+bool FaunusIndex::finalize(size_t num_maintenance_threads_per_queue) {
+    stop_maintenance(num_maintenance_threads_per_queue);
+    return true;
 }
 
 std::set<size_t> FaunusIndex::get_required_sizes() {
@@ -342,7 +353,7 @@ bool FaunusIndex::handle_local_remove_dupes(const Key& key, GlobalAddress leaf_a
                         // if succeeded - good!
                         if (tmp_expected_kvb == expected_kvb) {
                             return true;
-                        }   
+                        }
                     }
                     // either SMO or entry was deleted - start from scratch
                     return false;
@@ -355,14 +366,20 @@ bool FaunusIndex::handle_local_remove_dupes(const Key& key, GlobalAddress leaf_a
                 // set random value in KVBlock
                 RDMAOp op{RDMAOpType::CAS, kbvlock_address};
                 op.op.cas.expected = reinterpret_cast<uint64_t>(&leaf.kv_blocks[index]);
-                KVBlock new_kvb = faunus_util::thread_rand64();
+                KVBlock new_kvb = util::thread_rand64();
                 // preserve lock and free bits
                 new_kvb.setLocked(leaf.kv_blocks[index].isLocked());
                 new_kvb.setFree(leaf.kv_blocks[index].isFree());
                 op.op.cas.desired = new_kvb.raw;
                 // LOG_DEBUG("Removing duplicate entry at index " << index << " in leaf " << leaf_address << " by setting fingerprint to random value " << op.op.cas.desired);
+                KVBlock old_expected = op.op.cas.expected;
                 assert(rdma_mgr_->perform_op(op));
                 // TODO: free KVItem space
+                // If CAS succeeded, free the KVItem
+                if (old_expected == op.op.cas.expected) {
+                    GlobalAddress kvitem_address = old_expected.getAddr();
+                    allocator_->free(sizeof(KVItem), kvitem_address);
+                }
             }
         }
     }
@@ -766,11 +783,11 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
     // Clear the rest of the entries
     for (size_t i = middle; i < branch_factor; i++) {
         // set to random value, unlocked, free
-        leaf.kv_blocks[i] = faunus_util::thread_rand64();
+        leaf.kv_blocks[i] = util::thread_rand64();
         leaf.kv_blocks[i].setLocked(false);
         leaf.kv_blocks[i].setFree(true);
         if (i > middle || entries.size() % 2 == 0) {
-            new_leaf.kv_blocks[i] = faunus_util::thread_rand64();
+            new_leaf.kv_blocks[i] = util::thread_rand64();
             new_leaf.kv_blocks[i].setLocked(false);
             new_leaf.kv_blocks[i].setFree(true);
         }
@@ -1080,11 +1097,12 @@ bool FaunusIndex::request_smo(FaunusMaintenanceRPC::OpType op, GlobalAddress lea
     
     // Fallback to regular maintenance queues (legacy behavior)
     size_t num_queues = num_maintenance_queues();
-    if (num_queues == 0) return false;
+    if (num_queues == 0) return std::cout << "got num_queues 0" << std::endl, false;
     size_t queue_idx = std::hash<uint64_t>{}(leaf_address.raw) % num_queues;
     auto queue = get_maintenance_queue(queue_idx);
     if (!queue) {
-        return false;
+        return std::cout << "got null queue" << std::endl, false;
+        // return false;
     }
     FaunusMaintenanceRPC rpc{.op=op, .leaf_address=leaf_address};
     {

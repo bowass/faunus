@@ -46,7 +46,7 @@ bool RDMASimulation::rdma_cas(RDMAOp& op) {
     Profiler::Scoped scope("rdma.cas");
     assert(op.type == RDMAOpType::CAS);
     
-    // std::this_thread::sleep_for(std::chrono::microseconds(faunus_config::CAS_DELAY_US));
+    // std::this_thread::sleep_for(std::chrono::microseconds(config::CAS_DELAY_US));
     bool result = false;
     if (op.addr + sizeof(uint64_t) <= memory_.size()) {
         result = true;

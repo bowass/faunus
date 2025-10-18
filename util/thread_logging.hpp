@@ -9,7 +9,7 @@
 #include <iomanip>
 #include <map>
 
-namespace faunus_log {
+namespace thread_log {
     enum LogLevel { LOG_ERROR = 0, LOG_WARN = 1, LOG_INFO = 2, LOG_DEBUG = 3 };
 
     inline int& log_level() {
@@ -85,10 +85,10 @@ namespace faunus_log {
     #define LOG(level, msg) do { \
         std::ostringstream oss; \
         oss << msg; \
-        ::faunus_log::log(level, oss.str()); \
+        ::thread_log::log(level, oss.str()); \
     } while (0)
-    #define LOG_ERROR(msg) LOG(::faunus_log::LOG_ERROR, msg)
-    #define LOG_WARN(msg)  LOG(::faunus_log::LOG_WARN,  msg)
-    #define LOG_INFO(msg)  LOG(::faunus_log::LOG_INFO,  msg)
-    #define LOG_DEBUG(msg) LOG(::faunus_log::LOG_DEBUG, msg)
+    #define LOG_ERROR(msg) LOG(::thread_log::LOG_ERROR, msg)
+    #define LOG_WARN(msg)  LOG(::thread_log::LOG_WARN,  msg)
+    #define LOG_INFO(msg)  LOG(::thread_log::LOG_INFO,  msg)
+    #define LOG_DEBUG(msg) LOG(::thread_log::LOG_DEBUG, msg)
 }
