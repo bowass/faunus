@@ -344,8 +344,9 @@ bool FaunusIndex::handle_local_remove_dupes(const Key& key, GlobalAddress leaf_a
                     GlobalAddress kbvlock_address = leaf_address + OFFSET_OF_ARRAY_ELEM(LeafNode, kv_blocks, index);
                     KVBlock expected_kvb = leaf.kv_blocks[index];
                     KVBlock tmp_expected_kvb = expected_kvb;
-                    // continue while the fingerprint remained the same - it means that
-                    while (tmp_expected_kvb.getFingerprint() == expected_kvb.getFingerprint()) {
+                    // continue if fingerprint remained the same, and not free or locked
+                    // --> the only thing that can change is the addr
+                    while (tmp_expected_kvb.getFingerprint() == expected_kvb.getFingerprint() && !tmp_expected_kvb.isFree() && !tmp_expected_kvb.isLocked()) {
                         RDMAOp op{RDMAOpType::CAS, kbvlock_address};
                         op.op.cas.expected = reinterpret_cast<uint64_t>(&tmp_expected_kvb);
                         op.op.cas.desired = new_kvblock.raw;
