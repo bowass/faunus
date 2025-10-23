@@ -9,9 +9,8 @@
 #include <set>
 
 #include "../util/logging.hpp"
-
-using size_t = std::size_t;
-using int64_t = std::int64_t;
+#include "../util/profiler.hpp"
+#include "../externals/concurrentqueue/concurrentqueue.h"
 
 
 /**
@@ -37,41 +36,48 @@ public:
     }
     // Allocate a chunk, with exponential growth if needed
     int64_t allocate() {
-        std::lock_guard<std::mutex> lock(mu_);
-        int64_t offset = get_free_slab_nolock();
-        if (offset != -1) return offset;
-        // No free slab, grow
-        // LOG_DEBUG("[SlabAllocator] Growing slab for size " << slab_size_ << " by " << num_slabs_);
-        get_slabs_nolock(num_slabs_);
-        offset = get_free_slab_nolock();
-        if (offset == -1) {
-            // LOG_DEBUG("[SlabAllocator] Still failed to allocate after growth for size " << slab_size_);
+        Profiler::Scoped scope("SlabAllocator::allocate");
+        int64_t offset;
+        if (free_list_.try_dequeue(offset)) {
+            return offset;
         }
-        return offset;
+        // No free slab available: try to grow, but serialize growth to
+        // avoid multiple threads performing expensive backing allocations.
+        std::lock_guard<std::mutex> growth_lock(growth_mu_);
+        // After acquiring the growth lock, try dequeue again in case
+        // another thread already grew the slab.
+        if (free_list_.try_dequeue(offset)) {
+            return offset;
+        }
+        // Grow slabs and populate the queue
+        get_slabs_nolock(num_slabs_);
+        if (free_list_.try_dequeue(offset)) {
+            return offset;
+        }
+        // Failed to allocate after grow
+        return -1;
     }
     // Free a chunk by offset
     void free(int64_t offset) {
-        std::lock_guard<std::mutex> lock(mu_);
-        free_list_.push_back(offset);
-        --used_chunks_;
+        Profiler::Scoped scope("SlabAllocator::free");
+        free_list_.enqueue(offset);
     }
-    size_t free_count() const { return free_list_.size(); }
+    size_t free_count() const { return free_list_.size_approx(); }
     size_t slab_size() const { return slab_size_; }
 private:
     int64_t get_free_slab_nolock() {
-        if (!free_list_.empty()) {
-            int64_t offset = free_list_.back();
-            free_list_.pop_back();
-            ++used_chunks_;
+        int64_t offset;
+        if (free_list_.try_dequeue(offset)) {
             return offset;
         }
         return -1; // No free slab available
     }
     void get_slabs_nolock(size_t slabs_to_add) {
-        int64_t chunk_size = slabs_to_add * slab_size_;
-        int64_t new_chunk = allocator_->allocate(chunk_size);
-        auto new_offsets = get_offsets_from_chunk(new_chunk, chunk_size);
-        for (auto off : new_offsets) free_list_.push_back(off);
+        int64_t chunk_size = static_cast<int64_t>(slabs_to_add) * static_cast<int64_t>(slab_size_);
+        int64_t new_chunk = allocator_->allocate(static_cast<size_t>(chunk_size));
+        if (new_chunk == -1) return;
+        auto new_offsets = get_offsets_from_chunk(new_chunk, static_cast<size_t>(chunk_size));
+        for (auto off : new_offsets) free_list_.enqueue(off);
         num_slabs_ += new_offsets.size();
     }
     std::vector<int64_t> get_offsets_from_chunk(int64_t start_offset, size_t chunk_size) {
@@ -83,9 +89,9 @@ private:
     }
     size_t slab_size_;
     size_t num_slabs_;
-    std::vector<int64_t> free_list_;
-    size_t used_chunks_ = 0;
-    std::mutex mu_;
+    moodycamel::ConcurrentQueue<int64_t> free_list_;
+    // Mutex used only for serializing slab growth
+    std::mutex growth_mu_;
     std::shared_ptr<Allocator> allocator_;
 };
 
