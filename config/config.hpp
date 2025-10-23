@@ -64,6 +64,8 @@ struct IndexConfig {
     // Keep the raw name for informational/logging purposes
     std::string index = "faunus";
     DistributionConfig distribution;
+    bool use_cache = true;
+    size_t max_cs_cache_size_mb = 32;
 };
 
 inline IndexConfig load_config(const std::string& yaml_path) {
@@ -123,6 +125,12 @@ inline IndexConfig load_config(const std::string& yaml_path) {
         } else {
             LOG_WARN("Unknown workload preset '" << cfg.workload << "'. Falling back to explicit operation_mix.");
         }
+    }
+
+    if (node["cache"]) {
+        auto cache_node = node["cache"];
+        if (cache_node["enabled"]) cfg.use_cache = cache_node["enabled"].as<bool>();
+        if (cache_node["max_size_mb"]) cfg.max_cs_cache_size_mb = cache_node["max_size_mb"].as<size_t>();
     }
 
     if (node["operation_mix"]) {

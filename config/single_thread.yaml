@@ -1,9 +1,9 @@
-num_cs: 4
-threads_per_cs: 1
+num_cs: 2
+threads_per_cs: 2
 num_ms: 1
 mem_per_ms: 1073741824
 cas_delay_us: 2
-base_rtt_us: 2
+base_rtt_us: 6
 initial_slabs_per_size: 32768
 maintenance_cs: 1
 threads_per_maintenance_cs: 1
@@ -14,12 +14,16 @@ warmup_inserts: 1000000
 # CPU core binding configuration
 cpu_binding_enabled: true
 cpu_binding_start_core: 0
-cpu_isolation_required: true
+cpu_isolation_required: false
 distribution:
-  type: uniform
-  key_space: 200000000
+  type: skewed
+  key_space: 200000
 operation_mix:
   insert: 1.0
   read: 0.0
   update: 0.0
   delete: 0.0
+# ycsb_workload: a
+cache:
+  enabled: true
+  max_size_mb: 16
