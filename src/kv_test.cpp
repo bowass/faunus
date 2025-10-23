@@ -24,8 +24,6 @@
 #include "../rdma/compute_server.hpp"
 #include "../config/config.hpp"
 #include "../kv_index/faunus_index.hpp"
-#include "../kv_index/index_cache.hpp"
-// #include "../kv_index/sherman_index.hpp"
 #include "../kv_index/fg_index.hpp"
 #include "../util/profiler.hpp"
 #include "../util/distribution.hpp"
@@ -52,12 +50,10 @@ int main(int argc, char* argv[]) {
     Profiler::reset();
 
     // Small factory to create KVIndex implementations based on config.index
-    auto make_index = [&config](std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer, std::shared_ptr<faunus_index_internal::IndexCache> cache) -> std::unique_ptr<KVIndex> {
+    auto make_index = [&config](std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer, std::shared_ptr<IndexCacheBase> cache) -> std::unique_ptr<KVIndex> {
         switch (config.index_type) {
             case IndexConfig::IndexType::Faunus:
                 return std::make_unique<FaunusIndex>(rdma_mgr, allocator, root_offset_pointer, cache);
-            // case IndexConfig::IndexType::Sherman:
-                // return std::make_unique<ShermanIndex>(rdma_mgr, allocator, root_offset_pointer, cache);
             default:
                 LOG_WARN("Unhandled index type - defaulting to FaunusIndex");
                 return std::make_unique<FaunusIndex>(rdma_mgr, allocator, root_offset_pointer, cache);
@@ -125,9 +121,14 @@ int main(int argc, char* argv[]) {
     std::vector<std::shared_ptr<ComputeServer>> compute_servers;
     std::vector<std::shared_ptr<ComputeServer>> maintenance_compute_servers;
 
-    std::set<size_t> sizes = FaunusIndex::get_required_sizes();
+    // Get required sizes from the configured index type
+    std::set<size_t> sizes;
     {
-        LOG_DEBUG("Required slab sizes for FaunusIndex: ");
+        auto temp_index = make_index(nullptr, nullptr, 0, nullptr);
+        sizes = temp_index->get_required_sizes();
+    }
+    {
+        LOG_DEBUG("Required slab sizes for index: ");
         std::ostringstream oss;
         for (auto s : sizes) oss << s << " ";
         LOG_DEBUG(oss.str());
@@ -143,20 +144,24 @@ int main(int argc, char* argv[]) {
         init_index->initialize(num_maintenance_cs);
         // KVIndex::get_root_offset_pointer() is part of the KVIndex interface — call directly
         root_offset_ptr = init_index->get_root_offset_pointer();
-        LOG_INFO("Initialized FaunusIndex with root at global address " << std::hex << root_offset_ptr << std::dec);
+        LOG_INFO("Initialized index with root at global address " << std::hex << root_offset_ptr << std::dec);
     }
 
     // Maintenance compute servers and queues
-    // TODO: add caches for maintenance servers
+    // Create caches per maintenance compute server (shared among threads in the same CS)
+    std::vector<std::shared_ptr<IndexCacheBase>> mcs_caches(num_cs);
+    
+    for (size_t mcs_id = 0; mcs_id < num_cs; ++mcs_id) {
+        LOG_INFO("Setting up cache for MCS " << mcs_id);
+        // Create cache using the factory method from a sample index
+        auto sample_index = make_index(rdma_mgr, nullptr, 0, nullptr);
+        // mcs_caches[mcs_id] = sample_index->create_cache(64 * 1024 * 1024); // 64MB
+        LOG_INFO("Created cache for MCS " << mcs_id << " targeting level 2");
+    }
+
     LOG_INFO("Launching " << num_maintenance_cs << " maintenance compute servers, " << threads_per_maintenance_cs << " threads each.");
     assert(num_maintenance_cs == 0 || threads_per_maintenance_cs > 0);
-    // Create caches per maintenance compute server (shared among threads in the same CS)
-    // Cache internal nodes at level 1 (one level above leaves)
-    std::vector<std::shared_ptr<faunus_index_internal::IndexCache>> mcs_caches(num_cs);
-    for (size_t mcs_id = 0; mcs_id < num_cs; ++mcs_id) {
-        mcs_caches[mcs_id] = std::make_shared<faunus_index_internal::IndexCache>(32768, 2); // 1024 entries, level 2
-        LOG_INFO("Created cache for CS " << mcs_id << " targeting level 2");
-    }
+
     for (size_t mcs_id = 0; mcs_id < num_maintenance_cs; ++mcs_id) {
         auto rpc_allocator = std::make_shared<RPCAllocator>(mem_servers);
         auto local_allocator = std::make_shared<LocalAllocator>(sizes, initial_slabs_per_size, rpc_allocator);
@@ -180,7 +185,7 @@ int main(int argc, char* argv[]) {
     }
 
     for (auto& mcs : maintenance_compute_servers) mcs->start();
-    
+
     // Removed redundant atomic counters to eliminate unnecessary thread synchronization:
     // These were causing performance overhead without providing useful functionality
     // since operation counts are already tracked per-thread in ThreadStats
@@ -207,9 +212,11 @@ int main(int argc, char* argv[]) {
 
     // Create caches per compute server (shared among threads in the same CS)
     // Cache internal nodes at level 1 (one level above leaves)
-    std::vector<std::shared_ptr<faunus_index_internal::IndexCache>> cs_caches(num_cs);
+    std::vector<std::shared_ptr<IndexCacheBase>> cs_caches(num_cs);
     for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
-        cs_caches[cs_id] = std::make_shared<faunus_index_internal::IndexCache>(32768, 1); // 1024 entries, level 1
+        // Create cache using the factory method from a sample index
+        auto sample_index = make_index(rdma_mgr, nullptr, 0, nullptr);
+        cs_caches[cs_id] = sample_index->create_cache(config.max_cs_cache_size_mb * 1024 * 1024);
         LOG_INFO("Created cache for CS " << cs_id << " targeting level 1");
     }
 
@@ -217,9 +224,12 @@ int main(int argc, char* argv[]) {
     for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
         auto rpc_allocator = std::make_shared<RPCAllocator>(mem_servers);
         auto local_allocator = std::make_shared<LocalAllocator>(sizes, initial_slabs_per_size, rpc_allocator);
-        // auto cache = cs_caches[cs_id];
-        auto cache = nullptr;
+        auto cache = cs_caches[cs_id];
+        if (!config.use_cache) {
+            cache = nullptr;
+        }
 
+	    std::cout << "Using cache? " << (cache != nullptr) << std::endl;
         auto worker = [cs_id, root_offset_ptr, &op_picker, &worker_summaries, &warmup_counter, &warmup_mutex, &warmup_cv, total_clients,
                        ops_per_client, warmup_total, &config, cache, &benchmark_start, &make_index](int tid, ThreadStats& stat,
                                               std::shared_ptr<RDMAManager> rdma_mgr,
@@ -405,7 +415,7 @@ int main(int argc, char* argv[]) {
                      << " RDMA total ns snapshot: " << rdma_stats_snapshot.total_rtt_ns);
 
             // Finalize cache stats before thread exits
-            faunus_index_internal::IndexCache::finalize_thread_stats();
+            // if (cache) cache->finalize_thread_stats();
             Profiler::publish_thread_stats();
         };
 
@@ -425,6 +435,7 @@ int main(int argc, char* argv[]) {
     auto dummy_index = make_index(nullptr, nullptr, 0, nullptr);
     dummy_index->finalize(threads_per_maintenance_cs);
 
+    // Wait for maintenance compute servers to finish as well
     for (auto& mcs : maintenance_compute_servers) mcs->join();
 
     auto benchmark_end = std::chrono::steady_clock::now();
@@ -499,37 +510,37 @@ int main(int argc, char* argv[]) {
     size_t total_invalid_ranges = 0;
     
     // TODO: are the caches stats global for all CSs?
-    for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
-        auto cache_stats = cs_caches[cs_id]->get_stats();
-        total_cache_hits += cache_stats.hits;
-        total_cache_misses += cache_stats.misses;
-        total_cache_entries += cache_stats.entries;
-        total_cache_evictions += cache_stats.evictions;
-        total_invalid_ranges += cache_stats.invalid_ranges;
+    // for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
+    //     auto cache_stats = cs_caches[cs_id]->get_stats();
+    //     total_cache_hits += cache_stats.hits;
+    //     total_cache_misses += cache_stats.misses;
+    //     total_cache_entries += cache_stats.entries;
+    //     total_cache_evictions += cache_stats.evictions;
+    //     total_invalid_ranges += cache_stats.invalid_ranges;
         
-        std::cout << "CS " << cs_id << " cache: hits=" << cache_stats.hits 
-                  << ", misses=" << cache_stats.misses 
-                  << ", hit_rate=" << std::fixed << std::setprecision(3) << cache_stats.hit_rate()
-                  << ", entries=" << cache_stats.entries
-                  << ", evictions=" << cache_stats.evictions 
-                  << ", invalid_ranges=" << cache_stats.invalid_ranges << std::endl;
-    }
+    //     std::cout << "CS " << cs_id << " cache: hits=" << cache_stats.hits 
+    //               << ", misses=" << cache_stats.misses 
+    //               << ", hit_rate=" << std::fixed << std::setprecision(3) << cache_stats.hit_rate()
+    //               << ", entries=" << cache_stats.entries
+    //               << ", evictions=" << cache_stats.evictions 
+    //               << ", invalid_ranges=" << cache_stats.invalid_ranges << std::endl;
+    // }
     
-    for (size_t mcs_id = 0; mcs_id < num_maintenance_cs; ++mcs_id) {
-        auto cache_stats = mcs_caches[mcs_id]->get_stats();
-        total_cache_hits += cache_stats.hits;
-        total_cache_misses += cache_stats.misses;
-        total_cache_entries += cache_stats.entries;
-        total_cache_evictions += cache_stats.evictions;
-        total_invalid_ranges += cache_stats.invalid_ranges;
+    // for (size_t mcs_id = 0; mcs_id < num_maintenance_cs; ++mcs_id) {
+    //     auto cache_stats = mcs_caches[mcs_id]->get_stats();
+    //     total_cache_hits += cache_stats.hits;
+    //     total_cache_misses += cache_stats.misses;
+    //     total_cache_entries += cache_stats.entries;
+    //     total_cache_evictions += cache_stats.evictions;
+    //     total_invalid_ranges += cache_stats.invalid_ranges;
         
-        std::cout << "MCS " << mcs_id << " cache: hits=" << cache_stats.hits 
-                  << ", misses=" << cache_stats.misses 
-                  << ", hit_rate=" << std::fixed << std::setprecision(3) << cache_stats.hit_rate()
-                  << ", entries=" << cache_stats.entries
-                  << ", evictions=" << cache_stats.evictions 
-                  << ", invalid_ranges=" << cache_stats.invalid_ranges << std::endl;
-    }
+    //     std::cout << "MCS " << mcs_id << " cache: hits=" << cache_stats.hits 
+    //               << ", misses=" << cache_stats.misses 
+    //               << ", hit_rate=" << std::fixed << std::setprecision(3) << cache_stats.hit_rate()
+    //               << ", entries=" << cache_stats.entries
+    //               << ", evictions=" << cache_stats.evictions 
+    //               << ", invalid_ranges=" << cache_stats.invalid_ranges << std::endl;
+    // }
 
     double overall_hit_rate = (total_cache_hits + total_cache_misses) == 0 ? 0.0 : 
         static_cast<double>(total_cache_hits) / static_cast<double>(total_cache_hits + total_cache_misses);
@@ -798,20 +809,20 @@ int main(int argc, char* argv[]) {
         summary_out << "    \"total_evictions\": " << total_cache_evictions << ",\n";
         summary_out << "    \"total_invalid_ranges\": " << total_invalid_ranges << ",\n";
         summary_out << "    \"per_cs\": [\n";
-        for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
-            auto cache_stats = cs_caches[cs_id]->get_stats();
-            summary_out << "      {\n";
-            summary_out << "        \"cs_id\": " << cs_id << ",\n";
-            summary_out << "        \"hits\": " << cache_stats.hits << ",\n";
-            summary_out << "        \"misses\": " << cache_stats.misses << ",\n";
-            summary_out << "        \"hit_rate\": " << cache_stats.hit_rate() << ",\n";
-            summary_out << "        \"entries\": " << cache_stats.entries << ",\n";
-            summary_out << "        \"evictions\": " << cache_stats.evictions << ",\n";
-            summary_out << "        \"invalid_ranges\": " << cache_stats.invalid_ranges << "\n";
-            summary_out << "      }";
-            if (cs_id + 1 < num_cs) summary_out << ",";
-            summary_out << "\n";
-        }
+        // for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
+        //     auto cache_stats = cs_caches[cs_id]->get_stats();
+        //     summary_out << "      {\n";
+        //     summary_out << "        \"cs_id\": " << cs_id << ",\n";
+        //     summary_out << "        \"hits\": " << cache_stats.hits << ",\n";
+        //     summary_out << "        \"misses\": " << cache_stats.misses << ",\n";
+        //     summary_out << "        \"hit_rate\": " << cache_stats.hit_rate() << ",\n";
+        //     summary_out << "        \"entries\": " << cache_stats.entries << ",\n";
+        //     summary_out << "        \"evictions\": " << cache_stats.evictions << ",\n";
+        //     summary_out << "        \"invalid_ranges\": " << cache_stats.invalid_ranges << "\n";
+        //     summary_out << "      }";
+        //     if (cs_id + 1 < num_cs) summary_out << ",";
+        //     summary_out << "\n";
+        // }
         summary_out << "    ]\n";
         summary_out << "  }\n";
         summary_out << "}\n";

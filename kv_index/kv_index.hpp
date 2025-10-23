@@ -2,12 +2,28 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <memory>
+#include <set>
 
 #include "array_var.hpp"
+#include "../rdma/global_address.hpp"
 
-// TODO: make it configurable using IndexConfig
 using Key = ArrayVar<8>;
 using Value = ArrayVar<8>;
+
+/**
+ * @brief Abstract base class for index caches
+ * This allows different index implementations to use different cache types
+ * while providing a common interface for cache management.
+ */
+class IndexCacheBase {
+public:
+    virtual ~IndexCacheBase() = default;
+    
+    // Optional: Add common cache interface methods if needed
+    // virtual void clear() = 0;
+    // virtual size_t size() const = 0;
+};
 
 struct KVItem {
     Key key;
@@ -19,14 +35,29 @@ inline std::ostream& operator<<(std::ostream& os, const KVItem& kv_item) {
     return os;
 }
 
-class GlobalAddress; // forward declaration
+class RDMAManager; // forward declaration
+class LocalAllocator; // forward declaration
 
 /**
  * @brief Abstract base class for a scalable key-value index over RDMA.
  */
 class KVIndex {
+protected:
+    std::shared_ptr<RDMAManager> rdma_mgr_;
+    std::shared_ptr<LocalAllocator> allocator_;
+    GlobalAddress root_offset_pointer_;
+    std::shared_ptr<IndexCacheBase> cache_;
 public:
+    KVIndex(std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer, std::shared_ptr<IndexCacheBase> cache = nullptr)
+        : rdma_mgr_(rdma_mgr), allocator_(allocator), root_offset_pointer_(root_offset_pointer), cache_(cache) {}
     virtual ~KVIndex() = default;
+    
+    /**
+     * @brief Factory method to create an appropriate cache for this index type
+     * @param cache_size_bytes Maximum cache size in bytes
+     * @return Shared pointer to cache instance, or nullptr if caching not supported
+     */
+    virtual std::shared_ptr<IndexCacheBase> create_cache(size_t cache_size_bytes) const { return nullptr; }
     /**
      * @brief Read the value for a given key.
      * @param key Pointer to key array
@@ -78,4 +109,10 @@ public:
      * @return GlobalAddress of the root offset pointer
      */
     virtual GlobalAddress get_root_offset_pointer() const = 0;
+
+    /**
+     * @brief Get the required memory slab sizes for this index implementation.
+     * @return Set of required memory allocation sizes in bytes
+     */
+    virtual std::set<size_t> get_required_sizes() const = 0;
 };
