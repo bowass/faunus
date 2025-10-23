@@ -6,7 +6,7 @@
 #include "../util/thread_logging.hpp"
 
 FGIndex::FGIndex(std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer)
-    : rdma_mgr_(rdma_mgr), allocator_(allocator), root_offset_pointer_(root_offset_pointer) {
+    : KVIndex(rdma_mgr, allocator, root_offset_pointer) {
     LOG_DEBUG("FGIndex created");
 }
 
@@ -34,7 +34,7 @@ bool FGIndex::initialize() {
     return true;
 }
 
-std::set<size_t> FGIndex::get_required_sizes() {
+std::set<size_t> FGIndex::get_required_sizes_static() {
     std::set<size_t> v{sizeof(GlobalAddress), sizeof(Value), sizeof(Node)};
     {
         std::ostringstream oss;
@@ -43,6 +43,10 @@ std::set<size_t> FGIndex::get_required_sizes() {
         LOG_DEBUG(oss.str());
     }
     return v;
+}
+
+std::set<size_t> FGIndex::get_required_sizes() const {
+    return get_required_sizes_static();
 }
 
 GlobalAddress FGIndex::get_root_offset_pointer() const {

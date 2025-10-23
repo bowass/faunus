@@ -28,7 +28,8 @@ public:
 
     bool initialize();
     GlobalAddress get_root_offset_pointer() const;
-    static std::set<size_t> get_required_sizes();
+    std::set<size_t> get_required_sizes() const override;
+    static std::set<size_t> get_required_sizes_static(); // Keep static version for compatibility
     // Print the entire tree from root
     void print_tree(size_t offset = 0, int depth = 0, bool show_kv = true);
 private:
@@ -65,9 +66,6 @@ private:
 
         ~Node() = default;
     };
-    std::shared_ptr<RDMAManager> rdma_mgr_;
-    std::shared_ptr<LocalAllocator> allocator_;
-    GlobalAddress root_offset_pointer_;
 
     // Helper methods for RDMA node access
     bool rdma_read_node(size_t offset, Node& node);
