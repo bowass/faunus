@@ -1,3 +1,4 @@
+#pragma once
 #include <cstdint>
 #include <iostream>
 
@@ -13,6 +14,14 @@ struct GlobalAddress {
     uint64_t offset() const { return raw & 0x0003FFFFFFFFFFULL; }
     operator uintptr_t() const { return static_cast<uintptr_t>(raw); }
     operator uint8_t*() const { return reinterpret_cast<uint8_t*>(raw); }
+
+    static GlobalAddress Null() { return GlobalAddress(0); }
+    bool operator==(const GlobalAddress& other) {
+        return raw == other.raw;
+    }
+    bool operator!=(const GlobalAddress& other) {
+        return !(raw == other.raw);
+    }
 };
 
 inline std::ostream& operator<<(std::ostream& os, const GlobalAddress& gaddr) {
