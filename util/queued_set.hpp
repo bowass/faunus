@@ -1,5 +1,5 @@
 #pragma once
-#include "../concurrentqueue/concurrentqueue.h"
+#include "../externals/concurrentqueue/concurrentqueue.h"
 #include <unordered_set>
 #include <mutex>
 #include <condition_variable>
@@ -10,6 +10,8 @@
 // Thread-safe queued-set that prevents duplicate entries from being enqueued
 // T should be the RPC type, K should be the key type for uniqueness checking
 // KeyExtractor should extract the key from T for uniqueness comparison
+
+// TODO: i'm really not sure that it's better than the regular queues
 
 template <typename T, typename K, typename KeyExtractor, typename KeyHash = std::hash<K>>
 class QueuedSet {

@@ -1,5 +1,5 @@
 #pragma once
-#include "../concurrentqueue/concurrentqueue.h"
+#include "../externals/concurrentqueue/concurrentqueue.h"
 #include <condition_variable>
 #include <mutex>
 #include <optional>

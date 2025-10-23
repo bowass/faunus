@@ -1,6 +1,6 @@
 #pragma once
 #include "rdma_simulation.hpp"
-#include "../concurrentqueue/concurrentqueue.h"
+#include "../externals/concurrentqueue/concurrentqueue.h"
 #include <unordered_set>
 #include <mutex>
 #include <condition_variable>
@@ -8,6 +8,8 @@
 #include <atomic>
 #include <utility>
 #include <future>
+
+// TODO: this is not implemented well, the only reason im leaving it as is because we rarey call it
 
 /**
  * @brief Simulated memory server providing RDMA access to a memory region.
