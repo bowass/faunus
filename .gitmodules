@@ -1,3 +1,6 @@
-[submodule "concurrentqueue"]
-	path = concurrentqueue
+[submodule "externals/skiplist"]
+	path = externals/skiplist
+	url = git@github.com:greensky00/skiplist.git
+[submodule "externals/concurrentqueue"]
+	path = externals/concurrentqueue
 	url = git@github.com:cameron314/concurrentqueue.git
