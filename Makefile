@@ -15,15 +15,20 @@ SRC = $(SRC_DIR)/main.cpp \
 OBJ = $(SRC:.cpp=.o)
 TARGET = faunus_sim
 
+SKIPLIST_DIR = externals/skiplist
+SKIPLIST_INCLUDE = -I$(SKIPLIST_DIR)/include
+CXXFLAGS += $(SKIPLIST_INCLUDE)
+SKIPLIST_SRC = $(SKIPLIST_DIR)/src/skiplist.cc
+
 KV_SRC = $(SRC_DIR)/kv_test.cpp \
          $(RDMA_DIR)/compute_server.cpp \
          $(RDMA_DIR)/memory_server.cpp \
          $(RDMA_DIR)/rdma_simulation.cpp \
          $(RDMA_DIR)/rdma_manager.cpp \
          $(KV_DIR)/faunus_index.cpp \
-         $(KV_DIR)/index_cache.cpp \
          $(UTIL_DIR)/profiler.cpp \
-         $(UTIL_DIR)/cpu_affinity.cpp
+         $(UTIL_DIR)/cpu_affinity.cpp \
+         $(SKIPLIST_SRC)
 KV_OBJ = $(KV_SRC:.cpp=.o)
 KV_TARGET = kv_test
 

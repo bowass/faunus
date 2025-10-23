@@ -155,9 +155,17 @@ All workers pull from the same queue, so slow threads don’t cap throughput. Ke
 	- Is there a bug in the current implementation?
 	- Think about a way to optimize splits, including making clients trigger less splits
 		- Maybe change watermarks?
-	- Implement `update`, maybe also `delete`
+	- Implement `delete`?
+	- IMPLEMENT A FUCKING WORKING 
+		- It seems to help, but not implemented efficient enough
 - Sherman + Marlin implementation
-- Store latencies per-thread
 - Visualization
-	- Plot throughput/latency graphs
+-	- Plot throughput/latency graphs
 	- Create a tikz plot generator
+- Test larger branch factor
+- After we optimized, check affect of many maintenance threads
+- what happens w/o sleep?
+
+
+- MemoryServer allocation is shit
+- 

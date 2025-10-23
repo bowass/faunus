@@ -8,6 +8,8 @@
 #include "../util/queued_set.hpp"
 #include "../util/thread_logging.hpp"
 #include "../util/profiler.hpp"
+// #include "../kv_index/index_cache.hpp"
+#include "../cache/range_cache.hpp"
 #include <vector>
 #include <set>
 #include <string>
@@ -175,17 +177,34 @@ namespace faunus_index_internal {
 
 using namespace faunus_index_internal;
 
-// Forward declaration
-namespace faunus_index_internal {
-    class IndexCache;
-}
+// Explicit template instantiation for InternalNode (IndexCache alias)
+// Instantiate the template for the InternalNode used by FaunusIndex so
+// callers can create shared_ptr<IndexCacheBase> from LockFreeSkiplistCache<InternalNode>.
+// Explicit instantiation for InternalNode is provided in index_cache.cpp
+// extern template class LockFreeSkiplistCache<InternalNode>;
+
+using FaunusCacheItem = std::pair<GlobalAddress, InternalNode>;
+using FaunusCache = RangeCache<Key, FaunusCacheItem>;
+
+// FaunusCache wrapper that inherits from IndexCacheBase
+class FaunusCacheWrapper : public IndexCacheBase {
+    std::shared_ptr<FaunusCache> cache_;
+public:
+    explicit FaunusCacheWrapper(std::shared_ptr<FaunusCache> cache) : cache_(cache) {}
+    std::shared_ptr<FaunusCache> get_cache() const { return cache_; }
+};
 
 /**
  * Faunus
  */
 class FaunusIndex : public KVIndex {
+private:
+    std::shared_ptr<FaunusCache> faunus_cache_; // Keep the specific type for internal use
 public:
-    FaunusIndex(std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer = 0, std::shared_ptr<faunus_index_internal::IndexCache> cache = nullptr);
+    FaunusIndex(std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer = 0, std::shared_ptr<IndexCacheBase> cache = nullptr);
+    
+    std::shared_ptr<IndexCacheBase> create_cache(size_t cache_size_bytes) const override;
+    
     bool insert(const Key& key, const Value& value);
     bool read(const Key& key, Value& value_out);
     bool update(const Key& key, const Value& value);
@@ -198,15 +217,12 @@ public:
     bool finalize(size_t num_maintenance_threads_per_queue=0);
 
     GlobalAddress get_root_offset_pointer() const;
-    static std::set<size_t> get_required_sizes();
+    std::set<size_t> get_required_sizes() const override;
+    static std::set<size_t> get_required_sizes_static(); // Keep static version for compatibility
+
     // Print the entire tree from root
     void print_tree(size_t offset = 0, int depth = 0, bool show_kv = true);
 private:
-    std::shared_ptr<RDMAManager> rdma_mgr_;
-    std::shared_ptr<LocalAllocator> allocator_;
-    std::shared_ptr<faunus_index_internal::IndexCache> cache_;
-    GlobalAddress root_offset_pointer_;
-
     static std::vector<std::shared_ptr<FaunusMaintenanceQueue>> s_faunus_maintenance_queues;
     static std::vector<std::shared_ptr<FaunusMaintenanceQueuedSet>> s_faunus_maintenance_queued_sets;
 
@@ -231,7 +247,7 @@ private:
     // from_insert is for the duplicate validation during insert - only at the end
     std::vector<std::pair<size_t, KVItem>> get_candidate_kvs(const LeafNode& leaf, const Fingerprint& fp, bool& sucess, bool from_insert=false, bool from_read=false);
 
-    FindNodeResult find_node(const Key& key, GlobalAddress& node_address, size_t level = 0, bool from_smo = false);
+    FindNodeResult find_node(const Key& key, GlobalAddress& node_address, Entry<Key, FaunusCacheItem>* &cached_entry, size_t level = 0, bool from_smo = false, bool use_cache = true);
     bool handle_local_remove_dupes(const Key& key, GlobalAddress leaf_address, const LeafNode& leaf, bool& found, Value& value_out, KVBlock new_kvblock=0, bool from_insert=false, bool from_read=false, bool from_update=false);
 
     bool request_smo(FaunusMaintenanceRPC::OpType op, GlobalAddress leaf_address);
