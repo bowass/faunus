@@ -39,8 +39,7 @@ struct IndexConfig {
     size_t threads_per_cs = 8;
     size_t num_ms = 8;
     size_t mem_per_ms = 512 * 1024;
-    size_t cas_delay_us = 50;
-    size_t base_rtt_us = 15;
+    size_t base_rtt_ns = 3000;
     size_t key_size = 8;
     size_t value_size = 8;
     size_t kv_per_thread = 1000;
@@ -65,7 +64,7 @@ struct IndexConfig {
     std::string index = "faunus";
     DistributionConfig distribution;
     bool use_cache = true;
-    size_t max_cs_cache_size_mb = 32;
+    size_t max_cs_cache_size_kb = 32;
 };
 
 inline IndexConfig load_config(const std::string& yaml_path) {
@@ -75,8 +74,7 @@ inline IndexConfig load_config(const std::string& yaml_path) {
     if (node["threads_per_cs"]) cfg.threads_per_cs = node["threads_per_cs"].as<size_t>();
     if (node["num_ms"]) cfg.num_ms = node["num_ms"].as<size_t>();
     if (node["mem_per_ms"]) cfg.mem_per_ms = node["mem_per_ms"].as<size_t>();
-    if (node["cas_delay_us"]) cfg.cas_delay_us = node["cas_delay_us"].as<size_t>();
-    if (node["base_rtt_us"]) cfg.base_rtt_us = node["base_rtt_us"].as<size_t>();
+    if (node["base_rtt_ns"]) cfg.base_rtt_ns = node["base_rtt_ns"].as<size_t>();
     if (node["key_size"]) cfg.key_size = node["key_size"].as<size_t>();
     if (node["value_size"]) cfg.value_size = node["value_size"].as<size_t>();
     if (node["kv_per_thread"]) cfg.kv_per_thread = node["kv_per_thread"].as<size_t>();
@@ -130,7 +128,7 @@ inline IndexConfig load_config(const std::string& yaml_path) {
     if (node["cache"]) {
         auto cache_node = node["cache"];
         if (cache_node["enabled"]) cfg.use_cache = cache_node["enabled"].as<bool>();
-        if (cache_node["max_size_mb"]) cfg.max_cs_cache_size_mb = cache_node["max_size_mb"].as<size_t>();
+        if (cache_node["max_size_kb"]) cfg.max_cs_cache_size_kb = cache_node["max_size_kb"].as<size_t>();
     }
 
     if (node["operation_mix"]) {

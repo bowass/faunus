@@ -1,16 +1,15 @@
 num_cs: 2
-threads_per_cs: 2
+threads_per_cs: 4
 num_ms: 1
 mem_per_ms: 1073741824
-cas_delay_us: 2
-base_rtt_us: 6
+base_rtt_ns: 3000
 initial_slabs_per_size: 32768
 maintenance_cs: 1
 threads_per_maintenance_cs: 1
 log_level: ERROR
 # log_level: DEBUG
-ops_per_client: 100000
-warmup_inserts: 1000000
+ops_per_client: 10000
+warmup_inserts: 100000
 # CPU core binding configuration
 cpu_binding_enabled: true
 cpu_binding_start_core: 0
@@ -25,5 +24,5 @@ operation_mix:
   delete: 0.0
 # ycsb_workload: a
 cache:
-  enabled: true
-  max_size_mb: 16
+  enabled: false
+  max_size_kb: 16384

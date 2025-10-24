@@ -43,7 +43,7 @@ int main(int argc, char* argv[]) {
     IndexConfig config = load_config(config_path);
     const size_t num_ms = config.num_ms;
     const size_t mem_per_server = config.mem_per_ms;
-    const double base_rtt_us = config.base_rtt_us;
+    const double base_rtt_ns = config.base_rtt_ns;
 
     set_log_level(config.log_level);
     thread_log::setup_thread_log();
@@ -110,7 +110,7 @@ int main(int argc, char* argv[]) {
         mem_servers.push_back(std::make_shared<MemoryServer>(mem_per_server));
     }
     // Create RDMA manager
-    auto rdma_mgr = std::make_shared<RDMAManager>(mem_servers, mem_per_server, base_rtt_us);
+    auto rdma_mgr = std::make_shared<RDMAManager>(mem_servers, mem_per_server, base_rtt_ns);
 
     LOG_INFO("\n====================== KV-index RDMA Stress Test ======================");
     const size_t num_cs = config.num_cs;
@@ -216,7 +216,7 @@ int main(int argc, char* argv[]) {
     for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
         // Create cache using the factory method from a sample index
         auto sample_index = make_index(rdma_mgr, nullptr, 0, nullptr);
-        cs_caches[cs_id] = sample_index->create_cache(config.max_cs_cache_size_mb * 1024 * 1024);
+        cs_caches[cs_id] = sample_index->create_cache(config.max_cs_cache_size_kb * 1024);
         LOG_INFO("Created cache for CS " << cs_id << " targeting level 1");
     }
 
