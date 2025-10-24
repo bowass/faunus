@@ -112,7 +112,7 @@ private:
         skiplist_node* node = skiplist_begin(&list_);
         if (!node || node == &list_.tail) return;
         EntryT* e = _get_entry(node, EntryT, node_);
-        if (skiplist_erase_node(&list_, node)) {
+        if (!skiplist_erase_node(&list_, node)) {
             delete e;
             entryCount_.fetch_sub(1, std::memory_order_relaxed);
         }
