@@ -3,6 +3,13 @@
 #include <chrono>
 #include <thread>
 
+#ifdef __x86_64__
+#include <immintrin.h>
+#define PAUSE() _mm_pause()
+#else
+#define PAUSE()
+#endif
+
 namespace util {
 
 /**
@@ -57,13 +64,8 @@ private:
      * Busy-wait until the target time, with periodic yields to be CPU-friendly.
      */
     static void busy_wait_until(std::chrono::high_resolution_clock::time_point target) {
-        constexpr int YIELD_INTERVAL = 100;  // Yield every 100 iterations
-        int iterations = 0;
-        
         while (std::chrono::high_resolution_clock::now() < target) {
-            if (++iterations % YIELD_INTERVAL == 0) {
-                std::this_thread::yield();  // Give other threads a chance
-            }
+            PAUSE();
             // Light busy-wait - modern CPUs handle this efficiently
         }
     }

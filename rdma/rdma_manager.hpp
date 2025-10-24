@@ -40,9 +40,9 @@ public:
      * @brief Construct an RDMA manager with memory servers and configuration.
      * @param mem_servers Vector of memory server pointers
      * @param mem_per_server Memory size per server
-     * @param base_rtt_us Base round-trip time in microseconds
+     * @param base_rtt_ns Base round-trip time in nanoseconds
      */
-    RDMAManager(const std::vector<std::shared_ptr<MemoryServer>>& mem_servers, size_t mem_per_server, double base_rtt_us = 1.0);
+    RDMAManager(const std::vector<std::shared_ptr<MemoryServer>>& mem_servers, size_t mem_per_server, uint64_t base_rtt_ns = 1000);
     // Perform a single RDMA operation
     /**
      * @brief Perform a single RDMA operation using the global address in RDMAOp.
@@ -68,7 +68,8 @@ public:
 private:
     std::vector<std::shared_ptr<MemoryServer>> mem_servers_;
     size_t mem_per_server_;
-    double base_rtt_us_;
+    const uint64_t base_rtt_ns_;
+    static constexpr uint64_t SIMULATED_BW_BPS = 12500000000ULL; // 100Gbps
     struct RDMAThreadStats {
         RDMAThreadStats() : thread_id(std::this_thread::get_id()) {}
         std::thread::id thread_id;
@@ -78,6 +79,12 @@ private:
     RDMAThreadStats& ensure_thread_stats() const;
     mutable std::mutex stats_mutex_;
     mutable std::vector<std::unique_ptr<RDMAThreadStats>> thread_stats_;
+
+    // Helper to acquire lock and measure wait time
+    std::pair<std::unique_lock<std::mutex>, uint64_t> acquire_server_lock(const std::shared_ptr<MemoryServer>& server);
+    // Helper for integer bandwidth delay calculation
+    uint64_t calculate_bw_delay_ns(const RDMAOp& op) const;
+
     // Helper
     /**
      * @brief Execute RDMA operation on mapped memory server.

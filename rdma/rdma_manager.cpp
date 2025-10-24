@@ -7,6 +7,37 @@
 #include "../util/logging.hpp"
 #include "../util/precise_sleep.hpp"
 
+std::pair<std::unique_lock<std::mutex>, uint64_t> RDMAManager::acquire_server_lock(const std::shared_ptr<MemoryServer>& server) {
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    // Acquire the server's queue lock to model contention/serialization
+    std::unique_lock<std::mutex> lock(server->get_rdma().get_queue_mutex()); 
+
+    auto end = std::chrono::high_resolution_clock::now();
+    uint64_t contention_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    
+    return std::make_pair(std::move(lock), contention_ns);
+}
+
+// Helper for integer bandwidth delay calculation
+uint64_t RDMAManager::calculate_bw_delay_ns(const RDMAOp& op) const {
+    size_t bytes = 0;
+    switch (op.type) {
+        case RDMAOpType::READ:
+        case RDMAOpType::WRITE:
+            bytes = op.op.write.bytes; // WRITE struct is used for all bulk transfers
+            break;
+        case RDMAOpType::CAS:
+        case RDMAOpType::FAA:
+            bytes = sizeof(uint64_t);
+            break;
+    }
+    // Delay (ns) = Bytes * (1,000,000,000 ns/s) / BW (B/s)
+    // Using long double intermediate to avoid overflow before the final division, 
+    // but the result is a precise integer nanosecond duration.
+    return (uint64_t)(((long double)bytes * 1000000000.0L) / SIMULATED_BW_BPS);
+}
+
 // Private helper to execute mapped RDMA operation
 bool RDMAManager::execute_rdma(RDMAOp& op) {
     Profiler::Scoped scope("rdma.execute");
@@ -23,6 +54,7 @@ bool RDMAManager::execute_rdma(RDMAOp& op) {
                 Profiler::Scoped op_scope("rdma.execute.read");
                 // std::cout << "will read" << std::endl;
                 result = server->get_rdma().rdma_read(local_op);
+                
                 // std::cout << "read results = " << result << std::endl;
             }
             break;
@@ -67,8 +99,8 @@ RDMAManager::RDMAThreadStats& RDMAManager::ensure_thread_stats() const {
     return *raw;
 }
 
-RDMAManager::RDMAManager(const std::vector<std::shared_ptr<MemoryServer>>& mem_servers, size_t mem_per_server, double base_rtt_us)
-    : mem_servers_(mem_servers), mem_per_server_(mem_per_server), base_rtt_us_(base_rtt_us) {
+RDMAManager::RDMAManager(const std::vector<std::shared_ptr<MemoryServer>>& mem_servers, size_t mem_per_server, uint64_t base_rtt_ns)
+    : mem_servers_(mem_servers), mem_per_server_(mem_per_server), base_rtt_ns_(base_rtt_ns) {
     reset_stats();
 }
 
@@ -86,31 +118,129 @@ std::shared_ptr<MemoryServer> RDMAManager::get_server(const GlobalAddress& gaddr
 
 bool RDMAManager::perform_op(RDMAOp& op) {
     Profiler::Scoped scope("rdma.perform_op");
-    util::precise_sleep_us(base_rtt_us_ / 2.0);
+
+    // First RTT half
+    size_t local_addr;
+    auto server = get_server(op.addr, local_addr);
+    if (!server) return false;
+
+    const uint64_t one_way_ns = base_rtt_ns_ / 2;
+
+    util::precise_sleep_ns(one_way_ns);
+
+    // acquiring simulates contention delay
+    auto [server_lock, contention_ns] = acquire_server_lock(server);
+    server_lock.unlock();
+
+    const uint64_t bw_delay_ns = calculate_bw_delay_ns(op);
+
+    // Simulate bandwidth delay
+    util::precise_sleep_ns(bw_delay_ns);
+
     bool result = execute_rdma(op);
-    util::precise_sleep_us(base_rtt_us_ / 2.0);
+    
+    // Second RTT half
+    // TODO: add async write support
+    util::precise_sleep_ns(one_way_ns + bw_delay_ns);
+
     auto& stats = ensure_thread_stats();
-    stats.op_counts[static_cast<size_t>(op.type)]++; // Simple increment, no atomic needed
-    stats.total_rtt_ns++; // Simple increment, no atomic needed
+    stats.op_counts[static_cast<size_t>(op.type)]++;
+    // TODO: add async write support
+    stats.total_rtt_ns += 2 * one_way_ns + contention_ns;
     return result;
 }
 
 
 bool RDMAManager::perform_batch(std::vector<RDMAOp>& ops) {
-    Profiler::Scoped scope("rdma.perform_batch");
+    // Profiler::Scoped scope("rdma.perform_batch");
     // LOG_DEBUG("Performing batch of size " << ops.size());
-    util::precise_sleep_us(base_rtt_us_ / 2.0);
-    for (auto op : ops) {
-        if (!execute_rdma(op)) {
-            return false;
-        }
+    // util::precise_sleep_us(base_rtt_us_ / 2.0);
+    // for (auto op : ops) {
+    //     if (!execute_rdma(op)) {
+    //         return false;
+    //     }
+    // }
+    // util::precise_sleep_us(base_rtt_us_ / 2.0);
+    // auto& stats = ensure_thread_stats();
+    // for (auto op : ops) {
+    //     stats.op_counts[static_cast<size_t>(op.type)]++;
+    //     stats.total_rtt_ns++;
+    // }
+
+    if (ops.empty()) {
+        return true;
     }
-    util::precise_sleep_us(base_rtt_us_ / 2.0);
+
+    Profiler::Scoped scope("rdma.perform_batch");
     auto& stats = ensure_thread_stats();
-    for (auto op : ops) {
+    
+    // 1. Simulate Batch Issue Time (Wall-clock sleep for the outgoing trip)
+    const uint64_t one_way_ns = base_rtt_ns_ / 2;
+    util::precise_sleep_ns(one_way_ns); 
+
+    // --- Critical Path Tracking ---
+    uint64_t max_server_path_ns = 0; // Max time spent on a single server's path (Contention + BW)
+    uint64_t max_return_trip_ns = 0; // Max return trip for synchronous ops
+
+    // Stores the total accumulated execution time (Contention + BW) for each server.
+    // This models the serialization of requests *at the server* for this specific batch.
+    std::unordered_map<std::shared_ptr<MemoryServer>, uint64_t> server_busy_until_ns;
+    
+    // 2. Execution and Contention Modeling Phase (Serial Loop to issue/model ops)
+    for (RDMAOp& op : ops) {
+        size_t local_addr;
+        auto server = get_server(op.addr, local_addr);
+        if (!server) return false;
+
+        // --- Contention Measurement (Control Plane Handshake) ---
+        // Acquire lock just to measure wait time, then release immediately.
+        // This models the contention for the server's control-plane resource.
+        // TODO: we acquire in a serial manner, assert that this is acceptable
+        auto [server_lock, contention_ns] = acquire_server_lock(server);
+        server_lock.unlock(); // Release immediately (crucial fix)
+
+        // --- Execution Latency (BW Delay) ---
+        uint64_t bw_delay_ns = calculate_bw_delay_ns(op);
+
+        // Accumulate time on the specific server's path (models serial execution at the server)
+        server_busy_until_ns[server] += bw_delay_ns;
+
+        // --- Execution Phase (Local Copy) ---
+        RDMAOp local_op = op;
+        local_op.addr = local_addr;
+        bool result = execute_rdma(local_op); // Instantaneous local execution
+        if (!result) return false;
+
+        // --- RTT and Stats Update ---
+        uint64_t op_return_trip_ns = 0;
+
+        op_return_trip_ns = one_way_ns;
+        // Track the maximum return trip time for the final wall-clock wait
+        max_return_trip_ns = std::max(max_return_trip_ns, op_return_trip_ns);
+
+        // Stats update (Individual op latency is calculated for accumulation)
         stats.op_counts[static_cast<size_t>(op.type)]++;
-        stats.total_rtt_ns++;
+        // stats.total_contention_ns += contention_ns;
+        
+        // Total latency attributed to this single operation for statistics
+        uint64_t op_total_latency_ns = one_way_ns + contention_ns + bw_delay_ns + op_return_trip_ns;
+        stats.total_rtt_ns += op_total_latency_ns;
     }
+
+    // 3. Determine and Apply Critical Path Delay (Wall-clock wait)
+    // The client thread now waits for the duration of the execution time on the slowest server.
+    for (const auto& pair : server_busy_until_ns) {
+        max_server_path_ns = std::max(max_server_path_ns, pair.second);
+    }
+    
+    // Wait for the total time required by the slowest server's serial execution path.
+    // This correctly models the parallel execution of the batch.
+    util::precise_sleep_ns(max_server_path_ns); 
+    
+    // 4. Simulate Final Return Trip Wait
+    // Wait for the completion of the slowest synchronous request.
+    util::precise_sleep_ns(max_return_trip_ns);
+
     return true;
 }
 

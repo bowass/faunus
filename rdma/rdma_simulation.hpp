@@ -11,40 +11,6 @@
 
 #include "../util/profiler.hpp"
 
-// Fast timing utilities to reduce chrono overhead
-namespace rdma_timing {
-    // Use CPU cycle counter for much faster timing (x86/x64 only)
-    inline uint64_t fast_timestamp() {
-        #if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
-            return __builtin_ia32_rdtsc();
-        #else
-            // Fallback to nanoseconds since epoch for other architectures
-            auto now = std::chrono::high_resolution_clock::now();
-            return std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-        #endif
-    }
-    
-    // Convert cycles to nanoseconds (approximate - depends on CPU frequency)
-    // For simulation purposes, we can use a rough conversion or disable if not needed
-    inline double cycles_to_ns(uint64_t cycles, double cpu_ghz = 3.0) {
-        return static_cast<double>(cycles) / cpu_ghz;
-    }
-    
-    // Check if high-precision timing is enabled (can be disabled for performance)
-    inline bool timing_enabled() {
-        // Can be controlled by environment variable or compile flag
-        #ifdef RDMA_NO_TIMING
-            return false; // Compile-time disable for maximum performance
-        #else
-            static bool enabled = std::getenv("RDMA_NO_TIMING") == nullptr; 
-            return enabled;
-        #endif
-    }
-    
-    // Utility to disable timing at runtime for performance testing
-    void set_timing_enabled(bool enabled);
-}
-
 // RDMA operation types
 /**
  * @brief Types of RDMA operations supported by the simulation.
@@ -123,6 +89,14 @@ public:
      * @param ops Vector of RDMAOp descriptors
      */
     void coalesce_ops(const std::vector<RDMAOp>& ops);
+
+    /**
+     * @brief Get the mutex for simulating NIC contention.
+     * @return std::mutex&
+     */
+    std::mutex& get_queue_mutex() { return queue_mutex_; }
 private:
     std::vector<uint8_t> memory_;
+    // simulates NIC bottleneck for contention
+    std::mutex queue_mutex_;
 };
