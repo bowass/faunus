@@ -35,6 +35,14 @@ public:
         get_slabs_nolock(num_slabs_);
     }
     // Allocate a chunk, with exponential growth if needed
+    int64_t allocate_nogrowth() {
+        Profiler::Scoped scope("SlabAllocator::allocate_nogrowth");
+        int64_t offset;
+        if (free_list_.try_dequeue(offset)) {
+            return offset;
+        }
+        return -1; // No free slab available
+    }
     int64_t allocate() {
         Profiler::Scoped scope("SlabAllocator::allocate");
         int64_t offset;
