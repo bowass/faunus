@@ -573,8 +573,7 @@ int main(int argc, char* argv[]) {
 
     std::array<util::AggregatedOpStats, static_cast<size_t>(OperationKind::Count)> op_totals{};
     
-    // Collect all latency samples for percentile calculation
-    std::array<std::vector<double>, static_cast<size_t>(OperationKind::Count)> all_samples;
+    // Note: Using histogram-based latency sampling for scalability
 
     for (size_t cs_id = 0; cs_id < compute_servers.size(); ++cs_id) {
         for (size_t tid = 0; tid < threads_per_cs; ++tid) {
@@ -636,10 +635,9 @@ int main(int argc, char* argv[]) {
                 json_out << ",\n";
                 json_out << "      \"total_latency_us\": " << entry.total_latency_us << ",\n";
                 
-                // Calculate percentiles for this thread
-                auto thread_samples = entry.latency_samples.get_samples();
-                if (!thread_samples.empty()) {
-                    auto [p50, p95, p99] = util::PercentileCalculator::calculate_standard(thread_samples);
+                // Calculate percentiles for this thread using histogram
+                if (entry.latency_samples.has_samples()) {
+                    auto [p50, p95, p99] = entry.latency_samples.calculate_standard_percentiles();
                     json_out << "      \"p50_latency_us\": " << p50 << ",\n";
                     json_out << "      \"p95_latency_us\": " << p95 << ",\n";
                     json_out << "      \"p99_latency_us\": " << p99 << ",\n";
@@ -662,26 +660,43 @@ int main(int argc, char* argv[]) {
                     agg_entry.max_latency_us = std::max(agg_entry.max_latency_us, entry.max_latency_us);
                 }
                 
-                // Collect latency samples for percentile calculation
-                auto samples = entry.latency_samples.get_samples();
-                all_samples[op_idx].insert(all_samples[op_idx].end(), samples.begin(), samples.end());
+                // Note: With histogram-based sampling, we can't aggregate raw samples
+                // Individual thread percentiles are calculated above using histograms
             }
             json_out << "  }\n";
             json_out << "}\n";
         }
     }
 
-    // Calculate percentiles for all operations using collected samples
+    // Calculate aggregate percentiles by merging histograms from all threads
     for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
         auto& agg_entry = op_totals[op_idx];
-        auto& samples = all_samples[op_idx];
         
-        if (!samples.empty()) {
-            auto [p50, p95, p99] = util::PercentileCalculator::calculate_standard(samples);
+        // Create aggregate histogram by merging all thread histograms
+        util::HistogramLatencySampler merged_histogram;
+        size_t total_sample_count = 0;
+        
+        for (const auto& cs : compute_servers) {
+            for (const auto& thread_stats : cs->get_thread_stats()) {
+                const auto& entry = thread_stats.per_op[op_idx];
+                // Get histogram data from each thread and merge
+                auto hist_data = entry.latency_samples.get_histogram();
+                for (const auto& [bucket_center, count] : hist_data) {
+                    // Add samples to merged histogram (approximate reconstruction)
+                    for (uint64_t i = 0; i < count; ++i) {
+                        merged_histogram.add_sample(bucket_center);
+                    }
+                }
+                total_sample_count += entry.latency_samples.sample_count();
+            }
+        }
+        
+        if (total_sample_count > 0) {
+            auto [p50, p95, p99] = merged_histogram.calculate_standard_percentiles();
             agg_entry.p50_latency_us = p50;
             agg_entry.p95_latency_us = p95;
             agg_entry.p99_latency_us = p99;
-            agg_entry.sample_count = samples.size();
+            agg_entry.sample_count = total_sample_count;
         }
     }
 

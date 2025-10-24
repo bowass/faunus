@@ -9,6 +9,7 @@
 #include "rdma_simulation.hpp"
 #include "rdma_manager.hpp"
 #include "local_allocator.hpp"
+#include "../util/histogram_latency_sampler.hpp"
 
 /**
  * @brief Per-thread statistics for RDMA operations.
@@ -21,48 +22,8 @@ enum class OperationKind : uint8_t {
     Count
 };
 
-/**
- * @brief Efficient circular buffer for latency samples (for percentile calculation)
- */
-class LatencySampler {
-private:
-    static constexpr size_t MAX_SAMPLES = 1000000;  // Maximum samples stored per operation
-    std::vector<double> samples_;
-    size_t write_index_ = 0;
-    size_t count_ = 0;
-    bool is_full_ = false;
-
-public:
-    void add_sample(double latency_us) {
-        if (samples_.size() < MAX_SAMPLES) {
-            samples_.push_back(latency_us);
-        } else {
-            samples_[write_index_] = latency_us;
-            write_index_ = (write_index_ + 1) % MAX_SAMPLES;
-            if (!is_full_ && write_index_ == 0) {
-                is_full_ = true;
-            }
-        }
-        count_++;
-    }
-
-    std::vector<double> get_samples() const {
-        if (!is_full_) {
-            return std::vector<double>(samples_.begin(), samples_.begin() + std::min(count_, samples_.size()));
-        }
-        // For full circular buffer, return samples in chronological order
-        std::vector<double> result;
-        result.reserve(samples_.size());
-        for (size_t i = 0; i < samples_.size(); ++i) {
-            size_t idx = (write_index_ + i) % samples_.size();
-            result.push_back(samples_[idx]);
-        }
-        return result;
-    }
-
-    size_t sample_count() const { return std::min(count_, MAX_SAMPLES); }
-    bool has_samples() const { return count_ > 0; }
-};
+// Use histogram-based latency sampler for scalability
+using LatencySampler = util::HistogramLatencySampler;
 
 struct ThreadStats {
     struct Entry {
