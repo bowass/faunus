@@ -32,8 +32,14 @@ bool RDMASimulation::rdma_write(RDMAOp& op) {
         return false;
     }
     
+    // std::cout << "RDMA_WRITE to " << std::hex << op.addr << " size " << std::dec << op.op.write.bytes << ", data: ";
+    // for (size_t i = 0; i < std::min(op.op.write.bytes, size_t(32)); ++i) {
+    //     std::cout << std::hex << static_cast<int>(op.op.write.buffer[i]) << " ";
+    // }
+    // std::cout << std::endl;
     std::copy(op.op.write.buffer, op.op.write.buffer + op.op.write.bytes, memory_.begin() + op.addr);
-    
+    // std::cout << "Done write." << std::endl;
+
     return true;
 }
 
@@ -41,7 +47,8 @@ bool RDMASimulation::rdma_write(RDMAOp& op) {
 bool RDMASimulation::rdma_cas(RDMAOp& op) {
     Profiler::Scoped scope("rdma.cas");
     assert(op.type == RDMAOpType::CAS);
-    
+
+    // std::cout << "RDMA_CAS to " << std::hex << op.addr << ", expected: " << std::hex << *reinterpret_cast<uint64_t*>(op.op.cas.expected) << ", desired: " << std::hex << op.op.cas.desired << std::endl;
     if (op.addr + sizeof(uint64_t) > memory_.size()) {
         return false;
     }

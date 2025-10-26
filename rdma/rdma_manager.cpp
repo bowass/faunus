@@ -7,6 +7,16 @@
 #include "../util/logging.hpp"
 #include "../util/precise_sleep.hpp"
 
+// Forward declaration to avoid circular dependency
+class ThreadStatsTracker;
+
+// Thread-local storage for stats tracker
+thread_local ThreadStatsTracker* RDMAManager::thread_stats_tracker_ = nullptr;
+
+void RDMAManager::set_thread_stats_tracker(ThreadStatsTracker* tracker) {
+    thread_stats_tracker_ = tracker;
+}
+
 std::pair<std::unique_lock<std::mutex>, uint64_t> RDMAManager::acquire_server_lock(const std::shared_ptr<MemoryServer>& server) {
     auto start = std::chrono::high_resolution_clock::now();
     
@@ -54,12 +64,12 @@ bool RDMAManager::execute_rdma(RDMAOp& op) {
                 Profiler::Scoped op_scope("rdma.execute.read");
                 // std::cout << "will read" << std::endl;
                 result = server->get_rdma().rdma_read(local_op);
-                
                 // std::cout << "read results = " << result << std::endl;
             }
             break;
         case RDMAOpType::WRITE:
             {
+                // std::cout << "Writing to " << op.addr << ", bytes: " << op.op.write.bytes << std::endl;
                 Profiler::Scoped op_scope("rdma.execute.write");
                 result = server->get_rdma().rdma_write(local_op);
             }
@@ -109,7 +119,6 @@ std::shared_ptr<MemoryServer> RDMAManager::get_server(const GlobalAddress& gaddr
     uint8_t server_id = gaddr.server_index();
     local_addr = gaddr.offset();
     if (server_id < mem_servers_.size()) {
-        // std::cout << "Mapping to server " << static_cast<int>(server_id) << " local_addr: " << std::hex << local_addr << std::dec << std::endl;
         return mem_servers_[server_id];
     }
     return nullptr;
@@ -147,6 +156,12 @@ bool RDMAManager::perform_op(RDMAOp& op) {
     stats.op_counts[static_cast<size_t>(op.type)]++;
     // TODO: add async write support
     stats.total_rtt_ns += 2 * one_way_ns + contention_ns;
+    
+    // Track operation in enhanced stats if tracker is set
+    if (thread_stats_tracker_) {
+        thread_stats_tracker_->record_rdma_op(op);
+    }
+    
     return result;
 }
 
@@ -240,6 +255,11 @@ bool RDMAManager::perform_batch(std::vector<RDMAOp>& ops) {
     // 4. Simulate Final Return Trip Wait
     // Wait for the completion of the slowest synchronous request.
     util::precise_sleep_ns(max_return_trip_ns);
+
+        // Track operation in enhanced stats if tracker is set
+    if (thread_stats_tracker_) {
+        thread_stats_tracker_->record_rdma_ops(ops);
+    }
 
     return true;
 }

@@ -9,56 +9,7 @@
 #include "rdma_simulation.hpp"
 #include "rdma_manager.hpp"
 #include "local_allocator.hpp"
-#include "../util/histogram_latency_sampler.hpp"
-
-/**
- * @brief Per-thread statistics for RDMA operations.
- */
-enum class OperationKind : uint8_t {
-    Insert = 0,
-    Read = 1,
-    Update = 2,
-    Delete = 3,
-    Count
-};
-
-// Use histogram-based latency sampler for scalability
-using LatencySampler = util::HistogramLatencySampler;
-
-struct ThreadStats {
-    struct Entry {
-        size_t successes = 0;
-        size_t failures = 0;
-        double total_latency_us = 0.0;
-        double min_latency_us = std::numeric_limits<double>::max();
-        double max_latency_us = 0.0;
-        LatencySampler latency_samples;  // For percentile calculation
-
-        void record(double latency_us, bool success) {
-            if (success) {
-                successes++;
-                total_latency_us += latency_us;
-                if (latency_us < min_latency_us) min_latency_us = latency_us;
-                if (latency_us > max_latency_us) max_latency_us = latency_us;
-                latency_samples.add_sample(latency_us);
-            } else {
-                failures++;
-            }
-        }
-    };
-
-    std::array<Entry, static_cast<size_t>(OperationKind::Count)> per_op{};
-
-    void record(OperationKind kind, double latency_us, bool success) {
-        per_op[static_cast<size_t>(kind)].record(latency_us, success);
-    }
-
-    void reset() {
-        for (auto& entry : per_op) {
-            entry = Entry();
-        }
-    }
-};
+#include "../util/thread_stats.hpp"
 
 /**
  * @brief General compute server that runs user-defined worker tasks in parallel threads.

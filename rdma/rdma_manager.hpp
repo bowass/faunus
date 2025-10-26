@@ -13,6 +13,7 @@
 #include <thread>
 #include "../util/profiler.hpp"
 
+#include "../util/thread_stats.hpp"
 
 /**
  * @brief RDMA manager for mapping global addresses and performing RDMA operations.
@@ -43,6 +44,13 @@ public:
      * @param base_rtt_ns Base round-trip time in nanoseconds
      */
     RDMAManager(const std::vector<std::shared_ptr<MemoryServer>>& mem_servers, size_t mem_per_server, uint64_t base_rtt_ns = 1000);
+    
+    /**
+     * @brief Set thread-local stats tracker for enhanced RDMA operation monitoring
+     * @param tracker Pointer to ThreadStatsTracker (can be nullptr to disable)
+     */
+    static void set_thread_stats_tracker(class ThreadStatsTracker* tracker);
+    
     // Perform a single RDMA operation
     /**
      * @brief Perform a single RDMA operation using the global address in RDMAOp.
@@ -79,6 +87,9 @@ private:
     RDMAThreadStats& ensure_thread_stats() const;
     mutable std::mutex stats_mutex_;
     mutable std::vector<std::unique_ptr<RDMAThreadStats>> thread_stats_;
+    
+    // Thread-local RDMA operation tracker for enhanced statistics
+    static thread_local class ThreadStatsTracker* thread_stats_tracker_;
 
     // Helper to acquire lock and measure wait time
     std::pair<std::unique_lock<std::mutex>, uint64_t> acquire_server_lock(const std::shared_ptr<MemoryServer>& server);
