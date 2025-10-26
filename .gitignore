@@ -30,3 +30,6 @@ benchmark_results/
 profiling_results/
 .profile_venv/
 *.perf
+*.tex
+*.pdf
+*.aux
