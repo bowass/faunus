@@ -5,7 +5,7 @@
 #include <cstdint>
 
 template <size_t N>
-class ArrayVar {
+class alignas(1) ArrayVar {
 protected:
     uint8_t data_[N];
 public:
@@ -137,7 +137,7 @@ private:
     int compare(const ArrayVar& other) const {
         return std::memcmp(data_, other.data_, N);
     }
-};
+} __attribute__((packed));
 
 namespace std {
 template <size_t N>

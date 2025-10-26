@@ -7,6 +7,7 @@
  */
 struct GlobalAddress {
     uint64_t raw : 50;
+    uint64_t padding: 12;
     GlobalAddress(uint8_t index, uint64_t off)
         : raw((static_cast<uint64_t>(index) << 42) | (off & 0x0003FFFFFFFFFFULL)) {}
     GlobalAddress(uint64_t address=0) : raw(address) {}
@@ -22,7 +23,9 @@ struct GlobalAddress {
     bool operator!=(const GlobalAddress& other) {
         return !(raw == other.raw);
     }
-};
+} __attribute__((packed));
+
+static_assert(sizeof(GlobalAddress) == 8);
 
 inline std::ostream& operator<<(std::ostream& os, const GlobalAddress& gaddr) {
     os << "(" << int(gaddr.server_index()) << ", 0x" << std::hex << gaddr.offset() << std::dec << ")";
