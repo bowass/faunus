@@ -25,6 +25,7 @@ KV_SRC = $(SRC_DIR)/kv_test.cpp \
          $(RDMA_DIR)/memory_server.cpp \
          $(RDMA_DIR)/rdma_simulation.cpp \
          $(RDMA_DIR)/rdma_manager.cpp \
+         $(KV_DIR)/sherman_index.cpp \
          $(KV_DIR)/faunus_index.cpp \
          $(UTIL_DIR)/profiler.cpp \
          $(UTIL_DIR)/cpu_affinity.cpp \

@@ -11,6 +11,14 @@
 using Key = ArrayVar<8>;
 using Value = ArrayVar<8>;
 
+// Forward declarations
+class RDMAManager;
+class LocalAllocator;
+class ThreadStatsTracker;
+namespace local_locks {
+    class LocalLockManager;
+}
+
 /**
  * @brief Abstract base class for index caches
  * This allows different index implementations to use different cache types
@@ -47,10 +55,25 @@ protected:
     std::shared_ptr<LocalAllocator> allocator_;
     GlobalAddress root_offset_pointer_;
     std::shared_ptr<IndexCacheBase> cache_;
+    std::shared_ptr<local_locks::LocalLockManager> local_lock_mgr_;
+    ThreadStatsTracker* stats_tracker_ = nullptr;  // Optional RDMA operation tracking
 public:
-    KVIndex(std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer, std::shared_ptr<IndexCacheBase> cache = nullptr)
-        : rdma_mgr_(rdma_mgr), allocator_(allocator), root_offset_pointer_(root_offset_pointer), cache_(cache) {}
+    KVIndex(std::shared_ptr<RDMAManager> rdma_mgr, 
+            std::shared_ptr<LocalAllocator> allocator, 
+            GlobalAddress root_offset_pointer, 
+            std::shared_ptr<IndexCacheBase> cache = nullptr,
+            std::shared_ptr<local_locks::LocalLockManager> local_lock_mgr = nullptr)
+        : rdma_mgr_(rdma_mgr), allocator_(allocator), root_offset_pointer_(root_offset_pointer), 
+          cache_(cache), local_lock_mgr_(local_lock_mgr) {}
     virtual ~KVIndex() = default;
+    
+    /**
+     * @brief Set the statistics tracker for RDMA operation monitoring
+     * @param tracker Pointer to ThreadStatsTracker for recording operations
+     */
+    void set_stats_tracker(ThreadStatsTracker* tracker) {
+        stats_tracker_ = tracker;
+    }
     
     /**
      * @brief Factory method to create an appropriate cache for this index type

@@ -68,6 +68,8 @@ namespace faunus_index_internal {
         operator uint64_t() const { return raw; }
     };
 
+    static_assert(sizeof(KVBlock) == sizeof(uint64_t));
+
     inline std::ostream& operator<<(std::ostream& os, const KVBlock& kvb) {
         os << "KVBlock(fp=" << kvb.getFingerprint() << ", ptr=" << kvb.getAddr() << ", free=" << kvb.isFree() << ", locked=" << kvb.isLocked() << ")";
         return os;
@@ -201,7 +203,11 @@ class FaunusIndex : public KVIndex {
 private:
     std::shared_ptr<FaunusCache> faunus_cache_; // Keep the specific type for internal use
 public:
-    FaunusIndex(std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer = 0, std::shared_ptr<IndexCacheBase> cache = nullptr);
+    FaunusIndex(std::shared_ptr<RDMAManager> rdma_mgr, 
+                 std::shared_ptr<LocalAllocator> allocator, 
+                 GlobalAddress root_offset_pointer = 0, 
+                 std::shared_ptr<IndexCacheBase> cache = nullptr,
+                 std::shared_ptr<local_locks::LocalLockManager> local_lock_mgr = nullptr);
     
     std::shared_ptr<IndexCacheBase> create_cache(size_t cache_size_bytes) const override;
     

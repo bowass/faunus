@@ -18,8 +18,12 @@ using namespace faunus_index_internal;
 std::vector<std::shared_ptr<FaunusMaintenanceQueue>> FaunusIndex::s_faunus_maintenance_queues;
 std::vector<std::shared_ptr<FaunusMaintenanceQueuedSet>> FaunusIndex::s_faunus_maintenance_queued_sets;
 
-FaunusIndex::FaunusIndex(std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer, std::shared_ptr<IndexCacheBase> cache)
-    : KVIndex(rdma_mgr, allocator, root_offset_pointer, cache) {
+FaunusIndex::FaunusIndex(std::shared_ptr<RDMAManager> rdma_mgr, 
+                        std::shared_ptr<LocalAllocator> allocator, 
+                        GlobalAddress root_offset_pointer, 
+                        std::shared_ptr<IndexCacheBase> cache,
+                        std::shared_ptr<local_locks::LocalLockManager> local_lock_mgr)
+    : KVIndex(rdma_mgr, allocator, root_offset_pointer, cache, local_lock_mgr) {
     // Extract the FaunusCache from the wrapper if provided
     if (cache_) {
         auto wrapper = std::dynamic_pointer_cast<FaunusCacheWrapper>(cache_);
@@ -175,7 +179,7 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
             rdma_read_object(*rdma_mgr_, node_address, node);
             // Add to cache if it's at the target cache level (one level above leaves)
             // TODO: change 1 to configurable target level
-            if (faunus_cache_ && !node.header.lock && node.header.level == 1) {
+            if (faunus_cache_ && !node.header.lock && (node.header.level == 1 + from_smo)) {
                 // std::cout << "FaunusIndex::find_node: caching node at address " << std::hex << node_address.raw << std::dec << " for key range (" << node.header.fence.first << ", " << node.header.fence.second << ")" << std::endl;
                 // std::cout << "Adding node to cache: " << node.header << std::endl;
                 faunus_cache_->add(node.header.fence.first, node.header.fence.second, {node_address, node});
@@ -1061,7 +1065,8 @@ bool FaunusIndex::request_smo(FaunusMaintenanceRPC::OpType op, GlobalAddress lea
             FaunusMaintenanceRPC rpc{.op=op, .leaf_address=leaf_address};
             {
                 Profiler::Scoped scope("faunus.request_smo.try_enqueue");
-                bool enqueued = queued_set->try_enqueue(std::move(rpc));
+                queued_set->try_enqueue(std::move(rpc));
+                // bool enqueued = 
                 // LOG_DEBUG("SMO request for leaf " << leaf_address << " (op=" << op << ") " 
                         //  << (enqueued ? "enqueued" : "already pending") << " to queued-set " << queue_idx);
             }

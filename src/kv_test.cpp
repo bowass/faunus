@@ -25,11 +25,15 @@
 #include "../config/config.hpp"
 #include "../kv_index/faunus_index.hpp"
 #include "../kv_index/fg_index.hpp"
+#include "../kv_index/sherman_index.hpp"
+#include "../kv_index/local_lock_manager.hpp"
 #include "../util/profiler.hpp"
 #include "../util/distribution.hpp"
 #include "../util/key_management.hpp"
 #include "../util/benchmark.hpp"
 #include "../util/cpu_affinity.hpp"
+#include "../util/thread_stats.hpp"
+// #include "../util/tracked_rdma_manager.hpp"
 
 // Using utility classes from dedicated headers
 
@@ -50,13 +54,19 @@ int main(int argc, char* argv[]) {
     Profiler::reset();
 
     // Small factory to create KVIndex implementations based on config.index
-    auto make_index = [&config](std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator, GlobalAddress root_offset_pointer, std::shared_ptr<IndexCacheBase> cache) -> std::unique_ptr<KVIndex> {
+    auto make_index = [&config](std::shared_ptr<RDMAManager> rdma_mgr, 
+                                std::shared_ptr<LocalAllocator> allocator, 
+                                GlobalAddress root_offset_pointer, 
+                                std::shared_ptr<IndexCacheBase> cache,
+                                std::shared_ptr<local_locks::LocalLockManager> local_lock_mgr = nullptr) -> std::unique_ptr<KVIndex> {
         switch (config.index_type) {
             case IndexConfig::IndexType::Faunus:
-                return std::make_unique<FaunusIndex>(rdma_mgr, allocator, root_offset_pointer, cache);
+                return std::make_unique<FaunusIndex>(rdma_mgr, allocator, root_offset_pointer, cache, local_lock_mgr);
+            case IndexConfig::IndexType::Sherman:
+                return std::make_unique<ShermanIndex>(rdma_mgr, allocator, root_offset_pointer, cache, local_lock_mgr);
             default:
                 LOG_WARN("Unhandled index type - defaulting to FaunusIndex");
-                return std::make_unique<FaunusIndex>(rdma_mgr, allocator, root_offset_pointer, cache);
+                return std::make_unique<FaunusIndex>(rdma_mgr, allocator, root_offset_pointer, cache, local_lock_mgr);
         }
     };
     
@@ -121,10 +131,26 @@ int main(int argc, char* argv[]) {
     std::vector<std::shared_ptr<ComputeServer>> compute_servers;
     std::vector<std::shared_ptr<ComputeServer>> maintenance_compute_servers;
 
+    // Create local lock managers per CS (shared among threads in same CS)
+    std::vector<std::shared_ptr<local_locks::LocalLockManager>> cs_local_lock_mgrs(num_cs);
+    std::vector<std::shared_ptr<local_locks::LocalLockManager>> mcs_local_lock_mgrs(num_maintenance_cs);
+    
+    for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
+        // cs_local_lock_mgrs[cs_id] = std::make_shared<local_locks::LocalLockManager>();
+        cs_local_lock_mgrs[cs_id] = nullptr; // TODO: disabling local locks for debug
+        LOG_INFO("Created local lock manager for CS " << cs_id);
+    }
+    
+    for (size_t mcs_id = 0; mcs_id < num_maintenance_cs; ++mcs_id) {
+        // mcs_local_lock_mgrs[mcs_id] = std::make_shared<local_locks::LocalLockManager>();
+        mcs_local_lock_mgrs[mcs_id] = nullptr; // TODO: disabling local locks for debug
+        LOG_INFO("Created local lock manager for MCS " << mcs_id);
+    }
+
     // Get required sizes from the configured index type
     std::set<size_t> sizes;
     {
-        auto temp_index = make_index(nullptr, nullptr, 0, nullptr);
+        auto temp_index = make_index(nullptr, nullptr, 0, nullptr, nullptr);
         sizes = temp_index->get_required_sizes();
     }
     {
@@ -140,7 +166,7 @@ int main(int argc, char* argv[]) {
         auto rpc_allocator = std::make_shared<RPCAllocator>(mem_servers);
         auto local_allocator = std::make_shared<LocalAllocator>(sizes, initial_slabs_per_size, rpc_allocator);
 
-        auto init_index = make_index(rdma_mgr, local_allocator, 0, nullptr);
+        auto init_index = make_index(rdma_mgr, local_allocator, 0, nullptr, nullptr);
         init_index->initialize(num_maintenance_cs);
         // KVIndex::get_root_offset_pointer() is part of the KVIndex interface — call directly
         root_offset_ptr = init_index->get_root_offset_pointer();
@@ -154,7 +180,7 @@ int main(int argc, char* argv[]) {
     for (size_t mcs_id = 0; mcs_id < num_cs; ++mcs_id) {
         LOG_INFO("Setting up cache for MCS " << mcs_id);
         // Create cache using the factory method from a sample index
-        auto sample_index = make_index(rdma_mgr, nullptr, 0, nullptr);
+        auto sample_index = make_index(rdma_mgr, nullptr, 0, nullptr, nullptr);
         // mcs_caches[mcs_id] = sample_index->create_cache(64 * 1024 * 1024); // 64MB
         LOG_INFO("Created cache for MCS " << mcs_id << " targeting level 2");
     }
@@ -166,11 +192,11 @@ int main(int argc, char* argv[]) {
         auto rpc_allocator = std::make_shared<RPCAllocator>(mem_servers);
         auto local_allocator = std::make_shared<LocalAllocator>(sizes, initial_slabs_per_size, rpc_allocator);
         // TODO: for some reason MCS caches makes stuff REAL slow
-        // auto cache = mcs_caches[mcs_id];
-        auto cache = nullptr;
+        auto cache = mcs_caches[mcs_id];
+        // auto cache = nullptr;
 
-        auto maintenance_worker = [mcs_id, root_offset_ptr, cache, &make_index](size_t tid, ThreadStats& stat, std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator) {
-            auto index = make_index(rdma_mgr, allocator, root_offset_ptr, cache);
+        auto maintenance_worker = [mcs_id, root_offset_ptr, cache, &make_index, local_lock_mgr = mcs_local_lock_mgrs[mcs_id]](size_t tid, ThreadStats& stat, std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator) {
+            auto index = make_index(rdma_mgr, allocator, root_offset_ptr, cache, local_lock_mgr);
             // if the index implementation provides a maintenance_worker override, call it
             index->maintenance_worker(mcs_id, tid);
         };
@@ -215,7 +241,7 @@ int main(int argc, char* argv[]) {
     std::vector<std::shared_ptr<IndexCacheBase>> cs_caches(num_cs);
     for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
         // Create cache using the factory method from a sample index
-        auto sample_index = make_index(rdma_mgr, nullptr, 0, nullptr);
+        auto sample_index = make_index(rdma_mgr, nullptr, 0, nullptr, nullptr);
         cs_caches[cs_id] = sample_index->create_cache(config.max_cs_cache_size_kb * 1024);
         LOG_INFO("Created cache for CS " << cs_id << " targeting level 1");
     }
@@ -231,10 +257,20 @@ int main(int argc, char* argv[]) {
 
 	    std::cout << "Using cache? " << (cache != nullptr) << std::endl;
         auto worker = [cs_id, root_offset_ptr, &op_picker, &worker_summaries, &warmup_counter, &warmup_mutex, &warmup_cv, total_clients,
-                       ops_per_client, warmup_total, &config, cache, &benchmark_start, &make_index](int tid, ThreadStats& stat,
+                       ops_per_client, warmup_total, &config, cache, &benchmark_start, &make_index, local_lock_mgr = cs_local_lock_mgrs[cs_id]](int tid, ThreadStats& stat,
                                               std::shared_ptr<RDMAManager> rdma_mgr,
                                               std::shared_ptr<LocalAllocator> allocator) {
-            auto kv_index = make_index(rdma_mgr, allocator, root_offset_ptr, cache);
+            // Create thread-local enhanced statistics tracker
+            ThreadStatsTracker stats_tracker(stat);
+            
+            // Set the stats tracker on RDMAManager for automatic RDMA operation tracking
+            RDMAManager::set_thread_stats_tracker(&stats_tracker);
+            
+            // Create KV index with the original RDMA manager
+            auto kv_index = make_index(rdma_mgr, allocator, root_offset_ptr, cache, local_lock_mgr);
+            
+            // Set the stats tracker for RDMA operation monitoring
+            kv_index->set_stats_tracker(&stats_tracker);
             const size_t global_client_id = static_cast<size_t>(cs_id) * config.threads_per_cs + static_cast<size_t>(tid);
             const size_t warmup_per_client = warmup_total / total_clients + (global_client_id < (warmup_total % total_clients) ? 1 : 0);
 
@@ -247,10 +283,14 @@ int main(int argc, char* argv[]) {
             util::OperationRecorder recorder(stat);
             uint64_t sequence = 0;
 
+            // TODO: maybe add in the begin and end operation the start and end times? idk
             auto perform_insert = [&](const Key& key, const Value& value, bool update_local_state) {
+                stats_tracker.begin_operation(OperationKind::Insert);
                 auto start = std::chrono::high_resolution_clock::now();
                 bool ok = kv_index->insert(key, value);
                 auto end = std::chrono::high_resolution_clock::now();
+                auto latency_us = std::chrono::duration<double, std::micro>(end - start).count();
+                stats_tracker.end_operation(latency_us, ok);
                 recorder.record_result(OperationKind::Insert, start, end, ok);
                 if (ok) {
                     if (update_local_state) {
@@ -266,26 +306,35 @@ int main(int argc, char* argv[]) {
 
             auto perform_read = [&](const Key& key) {
                 Value val{};
+                stats_tracker.begin_operation(OperationKind::Read);
                 auto start = std::chrono::high_resolution_clock::now();
                 bool ok = kv_index->read(key, val);
                 auto end = std::chrono::high_resolution_clock::now();
+                auto latency_us = std::chrono::duration<double, std::micro>(end - start).count();
+                stats_tracker.end_operation(latency_us, ok);
                 recorder.record_result(OperationKind::Read, start, end, ok);
                 return ok;
             };
 
             auto perform_update = [&](const Key& key) {
                 Value new_value = util::generate_random_value(value_rng);
+                stats_tracker.begin_operation(OperationKind::Update);
                 auto start = std::chrono::high_resolution_clock::now();
                 bool ok = kv_index->update(key, new_value);
                 auto end = std::chrono::high_resolution_clock::now();
+                auto latency_us = std::chrono::duration<double, std::micro>(end - start).count();
+                stats_tracker.end_operation(latency_us, ok);
                 recorder.record_result(OperationKind::Update, start, end, ok);
                 return ok;
             };
 
             auto perform_delete = [&](size_t slot, const Key& key) {
+                stats_tracker.begin_operation(OperationKind::Delete);
                 auto start = std::chrono::high_resolution_clock::now();
                 bool ok = kv_index->del(key);
                 auto end = std::chrono::high_resolution_clock::now();
+                auto latency_us = std::chrono::duration<double, std::micro>(end - start).count();
+                stats_tracker.end_operation(latency_us, ok);
                 recorder.record_result(OperationKind::Delete, start, end, ok);
                 if (ok) {
                     key_set.deactivate(slot);
@@ -296,6 +345,7 @@ int main(int argc, char* argv[]) {
 
             // Warm-up inserts specific to this client
             for (size_t i = 0; i < warmup_per_client; ++i) {
+                // std::cout << "Warmup insert " << i + 1 << "/" << warmup_per_client << " for client " << global_client_id << "\n";
                 if (!key_set.can_insert()) break;
                 Key key = util::encode_key(global_client_id, sequence++);
                 Value value = util::generate_random_value(value_rng);
@@ -325,6 +375,7 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+
             auto select_active_slot = [&]() -> std::optional<size_t> {
                 size_t active = key_set.active_count();
                 if (active == 0) return std::nullopt;
@@ -333,6 +384,7 @@ int main(int argc, char* argv[]) {
                 if (pick >= active) pick = active - 1;
                 return key_set.slot_from_active_index(pick);
             };
+
 
             auto main_start = std::chrono::steady_clock::now();
             for (size_t op_idx = 0; op_idx < ops_per_client; ++op_idx) {
@@ -401,6 +453,7 @@ int main(int argc, char* argv[]) {
                 if (success) summary.succeeded++;
             }
             auto main_end = std::chrono::steady_clock::now();
+            
             summary.elapsed_sec = std::chrono::duration_cast<std::chrono::duration<double>>(main_end - main_start).count();
             if (summary.elapsed_sec > 0.0) {
                 summary.attempted_throughput = static_cast<double>(summary.attempted) / summary.elapsed_sec;
@@ -432,7 +485,7 @@ int main(int argc, char* argv[]) {
     for (auto& cs : compute_servers) cs->join();
 
     // Finalize by creating a dummy index of the configured type and calling finalize
-    auto dummy_index = make_index(nullptr, nullptr, 0, nullptr);
+    auto dummy_index = make_index(nullptr, nullptr, 0, nullptr, nullptr);
     dummy_index->finalize(threads_per_maintenance_cs);
 
     // Wait for maintenance compute servers to finish as well
@@ -584,9 +637,10 @@ int main(int argc, char* argv[]) {
                 const auto& entry = thread_stat.per_op[op_idx];
                 if (entry.successes == 0 && entry.failures == 0) continue;
                 std::cout << " op" << op_idx << " success=" << entry.successes << "/" << entry.successes + entry.failures;
-                if (entry.successes > 0) {
-                    double avg = entry.total_latency_us / entry.successes;
-                    std::cout << " avg_us=" << avg << " min_us=" << entry.min_latency_us << " max_us=" << entry.max_latency_us;
+                // Per-thread latency percentiles available from histogram
+                if (entry.latency_samples.has_samples()) {
+                    auto [p50, p95, p99] = entry.latency_samples.calculate_standard_percentiles();
+                    std::cout << " p50_us=" << p50 << " p95_us=" << p95 << " p99_us=" << p99;
                 }
             }
             std::cout << std::endl;
@@ -612,28 +666,6 @@ int main(int argc, char* argv[]) {
                 json_out << "    \"" << util::operation_name(op_idx) << "\": {\n";
                 json_out << "      \"successes\": " << entry.successes << ",\n";
                 json_out << "      \"failures\": " << entry.failures << ",\n";
-                json_out << "      \"avg_latency_us\": ";
-                if (entry.successes > 0) {
-                    json_out << (entry.total_latency_us / entry.successes);
-                } else {
-                    json_out << "null";
-                }
-                json_out << ",\n";
-                json_out << "      \"min_latency_us\": ";
-                if (entry.successes > 0) {
-                    json_out << entry.min_latency_us;
-                } else {
-                    json_out << "null";
-                }
-                json_out << ",\n";
-                json_out << "      \"max_latency_us\": ";
-                if (entry.successes > 0) {
-                    json_out << entry.max_latency_us;
-                } else {
-                    json_out << "null";
-                }
-                json_out << ",\n";
-                json_out << "      \"total_latency_us\": " << entry.total_latency_us << ",\n";
                 
                 // Calculate percentiles for this thread using histogram
                 if (entry.latency_samples.has_samples()) {
@@ -654,14 +686,8 @@ int main(int argc, char* argv[]) {
                 auto& agg_entry = op_totals[op_idx];
                 agg_entry.successes += entry.successes;
                 agg_entry.failures += entry.failures;
-                agg_entry.total_latency_us += entry.total_latency_us;
-                if (entry.successes > 0) {
-                    agg_entry.min_latency_us = std::min(agg_entry.min_latency_us, entry.min_latency_us);
-                    agg_entry.max_latency_us = std::max(agg_entry.max_latency_us, entry.max_latency_us);
-                }
                 
-                // Note: With histogram-based sampling, we can't aggregate raw samples
-                // Individual thread percentiles are calculated above using histograms
+                // Note: Legacy min/max/total latency removed - percentiles calculated from histograms below
             }
             json_out << "  }\n";
             json_out << "}\n";
@@ -736,27 +762,6 @@ int main(int argc, char* argv[]) {
             summary_out << "    \"" << util::operation_name(op_idx) << "\": {\n";
             summary_out << "      \"successes\": " << agg.successes << ",\n";
             summary_out << "      \"failures\": " << agg.failures << ",\n";
-            summary_out << "      \"avg_latency_us\": ";
-            if (agg.successes > 0) {
-                summary_out << (agg.total_latency_us / agg.successes);
-            } else {
-                summary_out << "null";
-            }
-            summary_out << ",\n";
-            summary_out << "      \"min_latency_us\": ";
-            if (agg.successes > 0) {
-                summary_out << agg.min_latency_us;
-            } else {
-                summary_out << "null";
-            }
-            summary_out << ",\n";
-            summary_out << "      \"max_latency_us\": ";
-            if (agg.successes > 0) {
-                summary_out << agg.max_latency_us;
-            } else {
-                summary_out << "null";
-            }
-            summary_out << ",\n";
             summary_out << "      \"p50_latency_us\": ";
             if (agg.sample_count > 0) {
                 summary_out << agg.p50_latency_us;
@@ -839,6 +844,111 @@ int main(int argc, char* argv[]) {
         //     summary_out << "\n";
         // }
         summary_out << "    ]\n";
+        summary_out << "  },\n";
+        
+        // Per-operation RDMA metrics: RTT histograms, RDMA operation counts, bytes transferred
+        summary_out << "  \"per_operation_rdma_metrics\": {\n";
+        for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
+            summary_out << "    \"" << util::operation_name(op_idx) << "\": {\n";
+            
+            // Aggregate RTT count histograms
+            stats::DiscreteHistogram rtt_histogram;
+            std::array<stats::DiscreteHistogram, 4> rdma_op_histograms;
+            stats::LogarithmicByteHistogram bytes_read_histogram;
+            stats::LogarithmicByteHistogram bytes_written_histogram;
+            stats::CacheStats cache_stats;
+            stats::DiscreteHistogram retry_histogram;
+            
+            for (const auto& cs : compute_servers) {
+                for (const auto& thread_stats : cs->get_thread_stats()) {
+                    const auto& entry = thread_stats.per_op[op_idx];
+                    
+                    // Aggregate histograms (simplified - just add all samples)
+                    for (uint32_t i = 0; i < 256; ++i) {
+                        uint64_t count = entry.rtt_counts_per_op.get_count(i);
+                        for (uint64_t j = 0; j < count; ++j) {
+                            rtt_histogram.record(i);
+                        }
+                        
+                        uint64_t retry_count = entry.retry_counts_per_op.get_count(i);
+                        for (uint64_t j = 0; j < retry_count; ++j) {
+                            retry_histogram.record(i);
+                        }
+                        
+                        for (size_t rdma_type = 0; rdma_type < 4; ++rdma_type) {
+                            uint64_t rdma_count = entry.rdma_op_counts_per_op[rdma_type].get_count(i);
+                            for (uint64_t j = 0; j < rdma_count; ++j) {
+                                rdma_op_histograms[rdma_type].record(i);
+                            }
+                        }
+                    }
+                    
+                    // Aggregate byte histograms (simplified)
+                    auto read_dist = entry.bytes_read_per_op.get_distribution();
+                    for (const auto& [range, count] : read_dist) {
+                        // Approximate: use middle of range for aggregation
+                        uint64_t approx_bytes = 1; // Start with 1B
+                        if (range.find("KB") != std::string::npos) approx_bytes *= 1024;
+                        else if (range.find("MB") != std::string::npos) approx_bytes *= 1024 * 1024;
+                        else if (range.find("GB") != std::string::npos) approx_bytes *= 1024 * 1024 * 1024;
+                        
+                        for (uint64_t j = 0; j < count; ++j) {
+                            bytes_read_histogram.record(approx_bytes);
+                        }
+                    }
+                    
+                    auto written_dist = entry.bytes_written_per_op.get_distribution();
+                    for (const auto& [range, count] : written_dist) {
+                        uint64_t approx_bytes = 1;
+                        if (range.find("KB") != std::string::npos) approx_bytes *= 1024;
+                        else if (range.find("MB") != std::string::npos) approx_bytes *= 1024 * 1024;
+                        else if (range.find("GB") != std::string::npos) approx_bytes *= 1024 * 1024 * 1024;
+                        
+                        for (uint64_t j = 0; j < count; ++j) {
+                            bytes_written_histogram.record(approx_bytes);
+                        }
+                    }
+                    
+                    // Cache stats are simple sums
+                    cache_stats.record_hit(); // Placeholder - would need actual values
+                    cache_stats.record_miss();
+                }
+            }
+            
+            // Output aggregated histograms
+            summary_out << "      \"rtt_distribution\": {\n";
+            summary_out << "        \"average\": " << rtt_histogram.get_average() << ",\n";
+            summary_out << "        \"total_samples\": " << rtt_histogram.total_samples() << "\n";
+            summary_out << "      },\n";
+            
+            summary_out << "      \"rdma_ops_per_operation\": {\n";
+            const char* rdma_names[] = {"READ", "WRITE", "CAS", "FAA"};
+            for (size_t i = 0; i < 4; ++i) {
+                summary_out << "        \"" << rdma_names[i] << "\": {\n";
+                summary_out << "          \"average\": " << rdma_op_histograms[i].get_average() << ",\n";
+                summary_out << "          \"total_samples\": " << rdma_op_histograms[i].total_samples() << "\n";
+                summary_out << "        }";
+                if (i < 3) summary_out << ",";
+                summary_out << "\n";
+            }
+            summary_out << "      },\n";
+            
+            summary_out << "      \"bytes_transferred\": {\n";
+            summary_out << "        \"read_avg_bytes\": " << bytes_read_histogram.get_average_bytes() << ",\n";
+            summary_out << "        \"read_total_bytes\": " << bytes_read_histogram.total_bytes() << ",\n";
+            summary_out << "        \"written_avg_bytes\": " << bytes_written_histogram.get_average_bytes() << ",\n";
+            summary_out << "        \"written_total_bytes\": " << bytes_written_histogram.total_bytes() << "\n";
+            summary_out << "      },\n";
+            
+            summary_out << "      \"retry_distribution\": {\n";
+            summary_out << "        \"average\": " << retry_histogram.get_average() << ",\n";
+            summary_out << "        \"total_samples\": " << retry_histogram.total_samples() << "\n";
+            summary_out << "      }\n";
+            
+            summary_out << "    }";
+            if (op_idx + 1 < static_cast<size_t>(OperationKind::Count)) summary_out << ",";
+            summary_out << "\n";
+        }
         summary_out << "  }\n";
         summary_out << "}\n";
     } else {

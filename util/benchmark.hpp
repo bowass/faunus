@@ -60,7 +60,7 @@ public:
     template <typename TimePoint>
     void record_result(OperationKind kind, const TimePoint& start, const TimePoint& end, bool success) {
         double latency_us = std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(end - start).count();
-        stats_.record(kind, latency_us, success);
+        stats_.record_operation(kind, latency_us, success);
     }
 
     void reset() {
@@ -97,11 +97,8 @@ inline const char* operation_name(size_t idx) {
 struct AggregatedOpStats {
     size_t successes = 0;
     size_t failures = 0;
-    double total_latency_us = 0.0;
-    double min_latency_us = std::numeric_limits<double>::max();
-    double max_latency_us = 0.0;
     
-    // Percentile statistics
+    // Percentile statistics (calculated from histograms)
     double p50_latency_us = 0.0;
     double p95_latency_us = 0.0;
     double p99_latency_us = 0.0;
