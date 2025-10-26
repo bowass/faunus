@@ -151,10 +151,10 @@ inline IndexConfig load_config(const std::string& yaml_path) {
         }
     }
 
-    if (cfg.ops_per_client == 0) {
-        size_t total_clients = std::max<size_t>(1, cfg.num_cs * cfg.threads_per_cs);
-        cfg.ops_per_client = cfg.total_ops > 0 ? std::max<size_t>(1, cfg.total_ops / total_clients) : cfg.kv_per_thread;
-    }
+    // if (cfg.ops_per_client == 0) {
+    //     size_t total_clients = std::max<size_t>(1, cfg.num_cs * cfg.threads_per_cs);
+    //     cfg.ops_per_client = cfg.total_ops > 0 ? std::max<size_t>(1, cfg.total_ops / total_clients) : cfg.kv_per_thread;
+    // }
 
     if (node["distribution"]) {
         auto dist_node = node["distribution"];
