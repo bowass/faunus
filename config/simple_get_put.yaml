@@ -1,28 +1,26 @@
-num_cs: 4
+num_cs: 2
 threads_per_cs: 2
-num_ms: 3
+num_ms: 2
 mem_per_ms: 1073741824
 base_rtt_ns: 300
 initial_slabs_per_size: 32768
 maintenance_cs: 1
 threads_per_maintenance_cs: 1
-log_level: ERROR
-# log_level: DEBUG
-ops_per_client: 100000
-warmup_inserts: 1000000
+log_level: INFO
+ops_per_client: 50000
+warmup_inserts: 100000
 # CPU core binding configuration
 cpu_binding_enabled: false
 cpu_binding_start_core: 0
 cpu_isolation_required: false
 distribution:
   type: skewed
-  key_space: 10000000
+  key_space: 1000000
 operation_mix:
-  insert: 1.0
-  read: 0.0
-  update: 0.0
-  delete: 0.0
-# ycsb_workload: a
+  insert: 0.3   # 30% PUT operations (insert-or-update)
+  read: 0.7     # 70% GET operations
+  update: 0.0   # Treated as PUT (insert-or-update)
+  delete: 0.0   # Treated as PUT (insert-or-update)
 cache:
   enabled: true
   max_size_kb: 16384

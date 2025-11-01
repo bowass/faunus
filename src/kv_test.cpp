@@ -33,7 +33,6 @@
 #include "../util/benchmark.hpp"
 #include "../util/cpu_affinity.hpp"
 #include "../util/thread_stats.hpp"
-// #include "../util/tracked_rdma_manager.hpp"
 
 // Using utility classes from dedicated headers
 
@@ -175,7 +174,7 @@ int main(int argc, char* argv[]) {
 
     // Maintenance compute servers and queues
     // Create caches per maintenance compute server (shared among threads in the same CS)
-    std::vector<std::shared_ptr<IndexCacheBase>> mcs_caches(num_cs);
+    std::vector<std::shared_ptr<IndexCacheBase>> mcs_caches(num_maintenance_cs);
     
     for (size_t mcs_id = 0; mcs_id < num_cs; ++mcs_id) {
         LOG_INFO("Setting up cache for MCS " << mcs_id);
@@ -239,11 +238,13 @@ int main(int argc, char* argv[]) {
     // Create caches per compute server (shared among threads in the same CS)
     // Cache internal nodes at level 1 (one level above leaves)
     std::vector<std::shared_ptr<IndexCacheBase>> cs_caches(num_cs);
-    for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
-        // Create cache using the factory method from a sample index
-        auto sample_index = make_index(rdma_mgr, nullptr, 0, nullptr, nullptr);
-        cs_caches[cs_id] = sample_index->create_cache(config.max_cs_cache_size_kb * 1024);
-        LOG_INFO("Created cache for CS " << cs_id << " targeting level 1");
+    if (config.use_cache) {
+        for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
+            // Create cache using the factory method from a sample index
+            auto sample_index = make_index(rdma_mgr, nullptr, 0, nullptr, nullptr);
+            cs_caches[cs_id] = sample_index->create_cache(config.max_cs_cache_size_kb * 1024);
+            LOG_INFO("Created cache for CS " << cs_id << " targeting level 1");
+        }
     }
 
     auto benchmark_start = std::chrono::steady_clock::now();
@@ -278,33 +279,24 @@ int main(int argc, char* argv[]) {
             std::mt19937_64 value_rng(std::random_device{}() ^ (static_cast<uint64_t>(global_client_id) << 16));
             auto& summary = worker_summaries[cs_id][tid];
 
-            util::KeySelectionSampler sampler(config.distribution);
-            util::LocalKeySet key_set(config.distribution.key_space);
+            util::KeySelectionSampler global_sampler(config.distribution);
+            global_sampler.update_active_count(config.distribution.key_space);
+            
             util::OperationRecorder recorder(stat);
-            uint64_t sequence = 0;
 
-            // TODO: maybe add in the begin and end operation the start and end times? idk
-            auto perform_insert = [&](const Key& key, const Value& value, bool update_local_state) {
+            // Simplified operation functions - insert does insert-or-update
+            auto perform_put = [&](const Key& key, const Value& value) {
                 stats_tracker.begin_operation(OperationKind::Insert);
                 auto start = std::chrono::high_resolution_clock::now();
-                bool ok = kv_index->insert(key, value);
+                bool ok = kv_index->insert(key, value);  // insert-or-update semantics
                 auto end = std::chrono::high_resolution_clock::now();
                 auto latency_us = std::chrono::duration<double, std::micro>(end - start).count();
                 stats_tracker.end_operation(latency_us, ok);
                 recorder.record_result(OperationKind::Insert, start, end, ok);
-                if (ok) {
-                    if (update_local_state) {
-                        if (key_set.add_new(key)) {
-                            sampler.update_active_count(key_set.active_count());
-                        } else {
-                            LOG_WARN("Client " << global_client_id << " failed to track inserted key due to capacity");
-                        }
-                    }
-                }
                 return ok;
             };
 
-            auto perform_read = [&](const Key& key) {
+            auto perform_get = [&](const Key& key) {
                 Value val{};
                 stats_tracker.begin_operation(OperationKind::Read);
                 auto start = std::chrono::high_resolution_clock::now();
@@ -316,49 +308,25 @@ int main(int argc, char* argv[]) {
                 return ok;
             };
 
-            auto perform_update = [&](const Key& key) {
-                Value new_value = util::generate_random_value(value_rng);
-                stats_tracker.begin_operation(OperationKind::Update);
-                auto start = std::chrono::high_resolution_clock::now();
-                bool ok = kv_index->update(key, new_value);
-                auto end = std::chrono::high_resolution_clock::now();
-                auto latency_us = std::chrono::duration<double, std::micro>(end - start).count();
-                stats_tracker.end_operation(latency_us, ok);
-                recorder.record_result(OperationKind::Update, start, end, ok);
-                return ok;
+            // Helper to generate a key from global key space using distribution
+            auto sample_global_key = [&]() -> Key {
+                return util::sample_key_from_global_space(op_rng, global_sampler, config.distribution.key_space);
             };
 
-            auto perform_delete = [&](size_t slot, const Key& key) {
-                stats_tracker.begin_operation(OperationKind::Delete);
-                auto start = std::chrono::high_resolution_clock::now();
-                bool ok = kv_index->del(key);
-                auto end = std::chrono::high_resolution_clock::now();
-                auto latency_us = std::chrono::duration<double, std::micro>(end - start).count();
-                stats_tracker.end_operation(latency_us, ok);
-                recorder.record_result(OperationKind::Delete, start, end, ok);
-                if (ok) {
-                    key_set.deactivate(slot);
-                    sampler.update_active_count(key_set.active_count());
-                }
-                return ok;
-            };
-
-            // Warm-up inserts specific to this client
+            // Warm-up using PUT operations with global key space distribution
             for (size_t i = 0; i < warmup_per_client; ++i) {
-                // std::cout << "Warmup insert " << i + 1 << "/" << warmup_per_client << " for client " << global_client_id << "\n";
-                if (!key_set.can_insert()) break;
-                Key key = util::encode_key(global_client_id, sequence++);
+                Key key = sample_global_key();  // Use global key space
                 Value value = util::generate_random_value(value_rng);
-                bool inserted = perform_insert(key, value, true);
+                bool inserted = perform_put(key, value);
                 if (!inserted) {
-                    // Stop warmup if insert fails consistently
+                    // Stop warmup if PUT fails consistently (very unlikely with insert-or-update)
                     break;
                 }
             }
 
             // reset stats
             recorder.reset();
-            sampler.update_active_count(key_set.active_count());
+            // global_sampler already has correct count (fixed key space)
 
             // Wait for all threads to complete warmup before starting main benchmark
             // Custom barrier implementation for C++17 compatibility
@@ -376,77 +344,23 @@ int main(int argc, char* argv[]) {
             }
 
 
-            auto select_active_slot = [&]() -> std::optional<size_t> {
-                size_t active = key_set.active_count();
-                if (active == 0) return std::nullopt;
-                sampler.update_active_count(active);
-                size_t pick = sampler.sample(op_rng);
-                if (pick >= active) pick = active - 1;
-                return key_set.slot_from_active_index(pick);
-            };
-
-
             auto main_start = std::chrono::steady_clock::now();
             for (size_t op_idx = 0; op_idx < ops_per_client; ++op_idx) {
                 OperationKind desired = op_picker.weighted_pick(op_rng);
-                OperationKind actual = desired;
-
-                auto ensure_valid_operation = [&]() -> bool {
-                    if (actual == OperationKind::Insert && !key_set.can_insert()) {
-                        if (key_set.has_active()) {
-                            actual = OperationKind::Update;
-                        } else {
-                            return false;
-                        }
-                    }
-                    if (actual != OperationKind::Insert && !key_set.has_active()) {
-                        if (key_set.can_insert()) {
-                            actual = OperationKind::Insert;
-                        } else {
-                            return false;
-                        }
-                    }
-                    return true;
-                };
-
-                if (!ensure_valid_operation()) {
-                    continue;
-                }
-
+                
+                // Simplify: treat insert/update/delete all as PUT (insert-or-update)
+                // Only GET and PUT operations now, no complex state tracking needed
                 bool success = false;
-                switch (actual) {
-                    case OperationKind::Insert: {
-                        Key key = util::encode_key(global_client_id, sequence++);
-                        Value value = util::generate_random_value(value_rng);
-                        success = perform_insert(key, value, true);
-                        break;
-                    }
-                    case OperationKind::Read: {
-                        auto slot_opt = select_active_slot();
-                        if (slot_opt) {
-                            const Key& key = key_set.key_at_slot(*slot_opt);
-                            success = perform_read(key);
-                        }
-                        break;
-                    }
-                    case OperationKind::Update: {
-                        auto slot_opt = select_active_slot();
-                        if (slot_opt) {
-                            const Key& key = key_set.key_at_slot(*slot_opt);
-                            success = perform_update(key);
-                        }
-                        break;
-                    }
-                    case OperationKind::Delete: {
-                        auto slot_opt = select_active_slot();
-                        if (slot_opt) {
-                            const Key& key = key_set.key_at_slot(*slot_opt);
-                            success = perform_delete(*slot_opt, key);
-                        }
-                        break;
-                    }
-                    case OperationKind::Count:
-                        continue;
+                Key key = sample_global_key();  // Always sample from global key space
+                
+                if (desired == OperationKind::Read) {
+                    // GET operation
+                    success = perform_get(key);
+                } else {
+                    // PUT operation (insert, update, delete all become puts)
+                    // insert() handles both new inserts and updates of existing keys
+                    Value value = util::generate_random_value(value_rng);
+                    success = perform_put(key, value);
                 }
 
                 summary.attempted++;
@@ -555,12 +469,24 @@ int main(int argc, char* argv[]) {
     }
     std::cout << " total RTT(ms): " << total_rtt_ms << std::endl;
 
-    // Collect and display cache statistics
+    // Collect and display cache statistics from thread stats
     size_t total_cache_hits = 0;
     size_t total_cache_misses = 0;
     size_t total_cache_entries = 0;
     size_t total_cache_evictions = 0;
     size_t total_invalid_ranges = 0;
+    
+    // Collect cache statistics from ThreadStats (per-thread tracking)
+    for (size_t cs_id = 0; cs_id < compute_servers.size(); ++cs_id) {
+        for (size_t tid = 0; tid < threads_per_cs; ++tid) {
+            const auto& thread_stat = compute_servers[cs_id]->get_thread_stats()[tid];
+            for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
+                const auto& entry = thread_stat.per_op[op_idx];
+                total_cache_hits += entry.cache_stats.hits();
+                total_cache_misses += entry.cache_stats.misses();
+            }
+        }
+    }
     
     // TODO: are the caches stats global for all CSs?
     // for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
@@ -678,7 +604,9 @@ int main(int argc, char* argv[]) {
                     json_out << "      \"p95_latency_us\": null,\n";
                     json_out << "      \"p99_latency_us\": null,\n";
                 }
-                json_out << "      \"sample_count\": " << entry.latency_samples.sample_count() << "\n";
+                json_out << "      \"sample_count\": " << entry.latency_samples.sample_count() << ",\n";
+                json_out << "      \"cache_hits\": " << entry.cache_stats.hits() << ",\n";
+                json_out << "      \"cache_misses\": " << entry.cache_stats.misses() << "\n";
                 json_out << "    }";
                 if (op_idx + 1 < static_cast<size_t>(OperationKind::Count)) json_out << ",";
                 json_out << "\n";

@@ -78,9 +78,10 @@ private:
 
 /**
  * Generates a deterministic key from client ID and sequence number.
+ * NOTE: This creates disjoint key ranges per client - use only for client-local sequences.
  */
 inline Key encode_key(uint64_t client_id, uint64_t sequence) {
-    Profiler::Scoped timer("client.encode_key");
+    // Profiler::Scoped timer("client.encode_key");
     Key key{};
     uint64_t raw = client_id * 0x9E3779B97F4A7C15ULL;
     raw ^= (sequence + 0xBF58476D1CE4E5B9ULL);
@@ -92,10 +93,31 @@ inline Key encode_key(uint64_t client_id, uint64_t sequence) {
 }
 
 /**
+ * Generates a key from global key space using distribution sampler.
+ * This creates realistic key distributions with potential thread contention.
+ */
+template<typename RNG>
+inline Key sample_key_from_global_space(RNG& rng, const util::KeySelectionSampler& sampler, size_t key_space_size) {
+    size_t key_index = sampler.sample(rng);
+    if (key_index >= key_space_size) {
+        key_index = key_index % key_space_size;  // Wrap around for safety
+    }
+    
+    Key key{};
+    // Use a different hash than encode_key to avoid correlation
+    uint64_t raw = key_index * 0x517CC1B727220A95ULL;
+    for (size_t i = 0; i < key.size(); ++i) {
+        key.data()[i] = static_cast<uint8_t>(raw & 0xFF);
+        raw = (raw >> 8) | (raw << 56);
+    }
+    return key;
+}
+
+/**
  * Generates a random value for testing purposes.
  */
 inline Value generate_random_value(std::mt19937_64& gen) {
-    Profiler::Scoped timer("client.generate_value");
+    // Profiler::Scoped timer("client.generate_value");
     Value value;
     std::uniform_int_distribution<uint8_t> dis(0, 255);
     for (size_t i = 0; i < value.size(); ++i) {
