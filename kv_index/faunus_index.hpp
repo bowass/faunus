@@ -65,6 +65,19 @@ namespace faunus_index_internal {
         void setFree(bool free) { raw = (raw & 0xFFFFFFFFFFFFFFFDULL) | (static_cast<uint64_t>(free) << 1); }
         void setLocked(bool locked) { raw = (raw & 0xFFFFFFFFFFFFFFFEULL) | static_cast<uint64_t>(locked); }    
 
+        void setDifferentRandomFpAddr() {
+            Fingerprint new_fp;
+            do {
+                new_fp = Fingerprint(util::thread_rand64() & 0x0FFF);
+            } while (new_fp == getFingerprint());
+            setFingerprint(new_fp);
+            GlobalAddress new_addr;
+            do {
+                new_addr = GlobalAddress(util::thread_rand64() & 0x0003FFFFFFFFFFULL);
+            } while (new_addr.raw == getAddr().raw);
+            setAddr(new_addr);
+        }
+
         operator uint64_t() const { return raw; }
     };
 
@@ -254,7 +267,10 @@ private:
     std::vector<std::pair<size_t, KVItem>> get_candidate_kvs(const LeafNode& leaf, const Fingerprint& fp, bool& sucess, bool from_insert=false, bool from_read=false);
 
     FindNodeResult find_node(const Key& key, GlobalAddress& node_address, Entry<Key, FaunusCacheItem>* &cached_entry, size_t level = 0, bool from_smo = false, bool use_cache = true);
-    bool handle_local_remove_dupes(const Key& key, GlobalAddress leaf_address, const LeafNode& leaf, bool& found, Value& value_out, KVBlock new_kvblock=0, bool from_insert=false, bool from_read=false, bool from_update=false);
+    // updates expected_kvb
+    bool try_delete_kvblock(GlobalAddress kvblock_address, KVBlock& expected_kvb);
+    bool try_update_kvblock(GlobalAddress kvblock_address, KVBlock& expected_kvb, const KVBlock& new_kvblock);
+    bool handle_local_remove_dupes(const Key& key, GlobalAddress leaf_address, LeafNode& leaf, bool& found, Value& value_out, KVBlock new_kvblock=0, bool from_insert=false, bool from_read=false, bool from_update=false);
 
     bool request_smo(FaunusMaintenanceRPC::OpType op, GlobalAddress leaf_address);
 
