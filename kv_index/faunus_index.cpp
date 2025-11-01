@@ -1,5 +1,6 @@
 #include "faunus_index.hpp"
 #include "../util/maintenance_queue.hpp"
+#include "../util/thread_stats.hpp"
 #include <cassert>
 #include <cstring>
 #include <cassert>
@@ -119,7 +120,6 @@ GlobalAddress FaunusIndex::update_root_offset(GlobalAddress new_root_offset) {
 }
 
 FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_address, Entry<Key, FaunusCacheItem>* &cached_entry, size_t level, bool from_smo, bool use_cache) {
-    // Profiler::Scoped scope("faunus.find_node");
     bool use_cached_node = false;
     InternalNode cached_node;
     GlobalAddress cached_address;
@@ -395,9 +395,10 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
                 if (faunus_cache_ && cached_entry != nullptr) {
                     faunus_cache_->invalidate(cached_entry);
                 }
-                // TODO: maybe yield instead? _mm_pause?
-                util::precise_sleep_us(1);
-                // std::this_thread::yield();
+                // did not get here because of the cache
+                else {
+                    PAUSE();
+                }
             }
             cached_entry = nullptr;
 
@@ -427,9 +428,6 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
 
             // smo or bad range - retry
             if (leaf.header.lock || key < leaf.header.fence.first || key >= leaf.header.fence.second) {
-                if (faunus_cache_ && cached_entry) {
-                    faunus_cache_->invalidate(cached_entry);
-                }
                 continue;
             }
         }
@@ -448,7 +446,14 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
                 // TODO: update instead
                 size_t index = candidate_kvs[i].first;
                 GlobalAddress kvblock_address = leaf_address + OFFSET_OF_ARRAY_ELEM(LeafNode, kv_blocks, index);
-                return try_update_kvblock(kvblock_address, leaf.kv_blocks[index], kvb);
+                success = try_update_kvblock(kvblock_address, leaf.kv_blocks[index], kvb);
+                if (cached_entry != nullptr) {
+                    stats_tracker_->record_cache_hit();
+                }
+                else {
+                    stats_tracker_->record_cache_miss();
+                }
+                return success;
             }
         }
 
@@ -500,9 +505,11 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         // leaf is already updated
         // SMO already dealt with duplicates
         if (leaf.header.lock || key < leaf.header.fence.first || key >= leaf.header.fence.second) {
-            // Even though insertion succeeded, leaf changed - invalidate cache
             if (cached_entry != nullptr) {
                 stats_tracker_->record_cache_hit();
+            }
+            else {
+                stats_tracker_->record_cache_miss();
             }
             return true;
         }
@@ -515,9 +522,11 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         if (num_used > branch_factor * 3 / 4) {
             success = request_smo(FaunusMaintenanceRPC::SPLIT, leaf_address);
             assert(success);
-            // Invalidate cache after SMO since tree structure will change
             if (cached_entry != nullptr) {
                 stats_tracker_->record_cache_hit();
+            }
+            else {
+                stats_tracker_->record_cache_miss();
             }
             return true;
         }
@@ -528,6 +537,9 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
             handle_local_remove_dupes(key, leaf_address, leaf, found, dummy, 0, true, false, false);
             if (cached_entry != nullptr) {
                 stats_tracker_->record_cache_hit();
+            }
+            else {
+                stats_tracker_->record_cache_miss();
             }
             return true;
         }
@@ -594,17 +606,21 @@ bool FaunusIndex::trylock_node(GlobalAddress node_address) {
     return rdma_try_acquire_lock(*rdma_mgr_, node_address + offsetof(LeafNode, header) + offsetof(Header, lock));
 }
 
-bool FaunusIndex::release_node(GlobalAddress node_address) {
-    return rdma_release_lock(*rdma_mgr_, node_address + offsetof(LeafNode, header) + offsetof(Header, lock));
+RDMAOp FaunusIndex::get_release_node_op(GlobalAddress node_address) {
+    GlobalAddress lock_address = node_address + offsetof(LeafNode, header) + offsetof(Header, lock);
+    RDMAOp op{RDMAOpType::FAA, lock_address};
+    op.op.faa.increment = -1;
+
+    return op;
 }
 
-bool FaunusIndex::lock_unlock_kvblocks(GlobalAddress leaf_address, bool to_lock) {
+std::vector<RDMAOp> FaunusIndex::get_lock_unlock_kvblocks(GlobalAddress leaf_address, bool to_lock) {
     std::vector<RDMAOp> ops;
     for (size_t i = 0; i < branch_factor; i++) {
         ops.push_back(RDMAOp{RDMAOpType::FAA, leaf_address + OFFSET_OF_ARRAY_ELEM(LeafNode, kv_blocks, i)});
         ops.back().op.faa.increment = to_lock ? 1 : -1; // set lock bit
     }
-    return rdma_mgr_->perform_batch(ops);
+    return ops;
 }
 
 bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
@@ -614,13 +630,16 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
         return false;
     }
 
-    // Acquire KVBlock locks
-    success = lock_unlock_kvblocks(leaf_address, true);
-    assert(success);
+    // Acquire KVBlock locks and read leaf
+    auto ops = get_lock_unlock_kvblocks(leaf_address, true);
 
-    // Read leaf
     LeafNode leaf;
-    rdma_read_object(*rdma_mgr_, leaf_address, leaf);
+    ops.push_back(RDMAOp{RDMAOpType::READ, leaf_address});
+    ops.back().op.read.buffer = reinterpret_cast<uint8_t*>(&leaf);
+    ops.back().op.read.bytes = sizeof(LeafNode);
+
+    assert(rdma_mgr_->perform_batch(ops));
+
     assert(leaf.header.lock);
 
     // Read all KVItems in the leaf
@@ -632,17 +651,17 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
         }
     }
 
-    // TODO: it is sufficient to read only keys for split
-    std::vector<KVItem> leaf_kvs;
-    if (!rdma_read_batch(*rdma_mgr_, item_pointers, leaf_kvs)) {
+    // Assuming Key is first in KVItem - reading keys only
+    std::vector<Key> leaf_keys;
+    if (!rdma_read_batch(*rdma_mgr_, item_pointers, leaf_keys)) {
         std::cout << leaf << std::endl;
         assert(false);
     }
 
     // Remove duplicate keys and sort
     std::map<Key, KVBlock> entries_map;
-    for (size_t i = 0; i < leaf_kvs.size(); i++) {
-        entries_map[leaf_kvs[i].key] = leaf.kv_blocks[i];
+    for (size_t i = 0; i < leaf_keys.size(); i++) {
+        entries_map[leaf_keys[i]] = leaf.kv_blocks[i];
     }
 
     // Test - validating fence
@@ -653,11 +672,11 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
     std::vector<std::pair<Key, KVBlock>> entries(entries_map.begin(), entries_map.end());
 
     if (entries.size() <= branch_factor / 2) {
-        // release kvblocks
-        assert(lock_unlock_kvblocks(leaf_address, false));
+        // release kvblocks and node
+        auto ops = get_lock_unlock_kvblocks(leaf_address, false);
+        ops.push_back(get_release_node_op(leaf_address));
 
-        // release node
-        assert(release_node(leaf_address));
+        assert(rdma_mgr_->perform_batch(ops));
         return false;
     }
 
@@ -698,20 +717,18 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
     new_leaf.header.fence = {middle_key, leaf.header.fence.second};
     leaf.header.fence.second = middle_key;
 
-    // Write sibling leaf first
-    success = rdma_write_object(*rdma_mgr_, new_leaf_address, new_leaf);
-    assert(success);
-
-    // Write back original leaf
-    success = rdma_write_object(*rdma_mgr_, leaf_address, leaf);
-    assert(success);
+    // Write sibling and leaf
+    std::vector<GlobalAddress> addresses{new_leaf_address, leaf_address};
+    std::vector<LeafNode> leaves{new_leaf, leaf};
+    assert(rdma_write_batch(*rdma_mgr_, addresses, leaves));
 
     // Insert new fence into parent
     success = insert_internal_entry(middle_key, new_leaf_address, 1);
     assert(success);
 
     // Release node lock
-    assert(release_node(leaf_address));
+    auto release_op = get_release_node_op(leaf_address);
+    assert(rdma_mgr_->perform_op(release_op));
     return true;
 }
 
@@ -721,12 +738,19 @@ bool FaunusIndex::insert_internal_entry(const Key& key, GlobalAddress new_child_
     InternalNode node;
     Entry<Key, FaunusCacheItem>* cached_entry = nullptr;
     for (size_t attempt = 0; attempt < 1000000; attempt++) {
-        if (attempt > 1000) {
-            // TODO: maybe sleep or yield?
-        }
+        // if (attempt > 0) {
+        //     // TODO: maybe sleep or yield?
+        //     if (faunus_cache_ && cached_entry != nullptr) {
+        //         faunus_cache_->invalidate(cached_entry);
+        //     }
+        //     else {
+        //         PAUSE();
+        //     }
+        // }
         // find leaf address
         // TODO: use cached entry node
-        FindNodeResult find_result = find_node(key, node_address, cached_entry, level, true);
+        cached_entry = nullptr;
+        FindNodeResult find_result = find_node(key, node_address, cached_entry, level, true, attempt == 0);
         assert(find_result != FindNodeResult::UNKNOWN);
         if (find_result == FindNodeResult::NO_SUCH_LEVEL) {
             // need to create a new root
@@ -734,6 +758,15 @@ bool FaunusIndex::insert_internal_entry(const Key& key, GlobalAddress new_child_
         }
         if (find_result != FindNodeResult::FOUND) {
             continue; // retry
+        }
+
+        // Track cache hit/miss for maintenance operations
+        if (stats_tracker_) {
+            if (cached_entry != nullptr) {
+                stats_tracker_->record_cache_hit();
+            } else {
+                stats_tracker_->record_cache_miss();
+            }
         }
 
         // Lock and read node
@@ -774,6 +807,8 @@ bool FaunusIndex::insert_internal_entry(const Key& key, GlobalAddress new_child_
             }
         }
 
+        std::vector<RDMAOp> batch_ops;
+
         bool need_split = !found && (node.header.last_index + 1 >= branch_factor);
         if (need_split) {
             split_internal_node(node_address, node, key, new_child_addr);
@@ -798,12 +833,14 @@ bool FaunusIndex::insert_internal_entry(const Key& key, GlobalAddress new_child_
             node.header.last_index++;
 
             // Write back node
-            success = rdma_write_object(*rdma_mgr_, node_address, node);
-            assert(success);
+            batch_ops.push_back(RDMAOp{RDMAOpType::WRITE, node_address});
+            batch_ops.back().op.write.buffer = reinterpret_cast<const uint8_t*>(&node);
+            batch_ops.back().op.write.bytes = sizeof(InternalNode);
         }
 
-        // release lock
-        assert(rdma_release_lock(*rdma_mgr_, lock_address));
+        // release lock and write if needed
+        batch_ops.push_back(get_release_node_op(node_address));
+        assert(rdma_mgr_->perform_batch(batch_ops));
 
         return true;
     }
@@ -869,16 +906,12 @@ bool FaunusIndex::split_internal_node(GlobalAddress node_address, InternalNode& 
     // Allocate new internal node
     GlobalAddress new_node_address = allocator_->allocate(sizeof(InternalNode));
 
-    // Write new node first
-    bool success = rdma_write_object(*rdma_mgr_, new_node_address, new_node);
-    assert(success);
-
-    // Write back original node
-    success = rdma_write_object(*rdma_mgr_, node_address, node);
-    assert(success);
+    std::vector<GlobalAddress> addresses{new_node_address, node_address};
+    std::vector<InternalNode> leaves{new_node, node};
+    assert(rdma_write_batch(*rdma_mgr_, addresses, leaves));
 
     // Insert new key
-    success = insert_internal_entry(middle_key, new_node_address, node.header.level + 1);
+    bool success = insert_internal_entry(middle_key, new_node_address, node.header.level + 1);
     assert(success);
 
     return false;
@@ -1015,6 +1048,13 @@ size_t FaunusIndex::num_maintenance_queued_sets() {
 void FaunusIndex::maintenance_worker(size_t cs_id, size_t thread_id) {
     std::cout << "Maintenance worker started (CS " << cs_id << ", thread " << thread_id << ") TID " << std::this_thread::get_id() << std::endl;
     
+    // Verify that stats tracker is set up for cache hit/miss tracking
+    if (stats_tracker_ == nullptr) {
+        std::cout << "Warning: Maintenance worker has no stats tracker - cache statistics will not be recorded" << std::endl;
+    } else {
+        std::cout << "Maintenance worker has stats tracker enabled for cache hit/miss tracking" << std::endl;
+    }
+    
     // Try to get a queued-set first (preferred), then fall back to regular queue
     auto queued_set = get_maintenance_queued_set(cs_id);
     auto queue = get_maintenance_queue(cs_id);
@@ -1024,6 +1064,8 @@ void FaunusIndex::maintenance_worker(size_t cs_id, size_t thread_id) {
     }
     
     std::string queue_type = queued_set ? "queued-set" : "queue";
+    
+    size_t operations_processed = 0;
     
     while (true) {
         FaunusMaintenanceRPC rpc;
@@ -1040,9 +1082,18 @@ void FaunusIndex::maintenance_worker(size_t cs_id, size_t thread_id) {
         }
         
         bool result = false;
+        auto start_time = std::chrono::high_resolution_clock::now();
+        
+        // Track maintenance operations as Insert operations for cache statistics
+        if (stats_tracker_) {
+            stats_tracker_->begin_operation(OperationKind::Insert);
+        }
+        
         switch (rpc.op) {
             case FaunusMaintenanceRPC::SPLIT:
+                // split_leaf internally calls find_node which tracks cache statistics
                 result = split_leaf(rpc.leaf_address);
+                operations_processed++;
                 break;
             case FaunusMaintenanceRPC::MERGE:
                 // result = merge_leaf(rpc.leaf_address);
@@ -1051,8 +1102,21 @@ void FaunusIndex::maintenance_worker(size_t cs_id, size_t thread_id) {
             case FaunusMaintenanceRPC::STOP:
                 return;
         }
+        
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto latency_us = std::chrono::duration<double, std::micro>(end_time - start_time).count();
+        
+        // Complete operation tracking
+        if (stats_tracker_) {
+            stats_tracker_->end_operation(latency_us, result);
+        }
+        
         rpc.result.set_value(result);
     }
+    
+    std::cout << "Maintenance worker (CS " << cs_id << ", thread " << thread_id 
+              << ") processed " << operations_processed << " operations" << std::endl;
+    
     // Finalize cache stats before thread exits
     // If this FaunusIndex has a cache instance, ask the cache to merge this
     // thread's TLS counters into its global counters.

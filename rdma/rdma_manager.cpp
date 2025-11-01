@@ -51,7 +51,7 @@ uint64_t RDMAManager::calculate_bw_delay_ns(const RDMAOp& op) const {
 // Private helper to execute mapped RDMA operation
 bool RDMAManager::execute_rdma(RDMAOp& op) {
     // Profiler::Scoped scope("rdma.execute");
-    // LOG_DEBUG("Executing RDMA operation: type=" << static_cast<int>(op.type) << ", gaddr=" << std::hex << static_cast<GlobalAddress>(op.addr).raw << std::dec);
+    LOG_DEBUG("Executing RDMA operation: type=" << static_cast<int>(op.type) << ", gaddr=" << std::hex << static_cast<GlobalAddress>(op.addr).raw << std::dec);
     RDMAOp local_op = op;
     size_t local_addr;
     auto server = get_server(op.addr, local_addr);

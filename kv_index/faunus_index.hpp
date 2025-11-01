@@ -274,9 +274,9 @@ private:
     bool request_smo(FaunusMaintenanceRPC::OpType op, GlobalAddress leaf_address);
 
     bool trylock_node(GlobalAddress node_address);
-    bool release_node(GlobalAddress node_address);
+    RDMAOp get_release_node_op(GlobalAddress node_address);
     // to_lock: true to lock, false to unlock
-    bool lock_unlock_kvblocks(GlobalAddress leaf_address, bool to_lock);
+    std::vector<RDMAOp> get_lock_unlock_kvblocks(GlobalAddress leaf_address, bool to_lock);
 
     bool split_leaf(GlobalAddress leaf_address);
     bool insert_internal_entry(const Key& key, GlobalAddress new_child_addr, size_t level);

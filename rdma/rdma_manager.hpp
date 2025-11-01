@@ -124,15 +124,35 @@ bool rdma_write_object(RDMAManager& rdma_mgr, GlobalAddress gaddr, const T& obj)
 }
 
 template<typename T>
-bool rdma_read_batch(RDMAManager& rdma_mgr, std::vector<GlobalAddress> gaddrs, std::vector<T>& objs) {
-    // Profiler::Scoped scope("rdma.read_batch");
-    std::vector<RDMAOp> ops;
+void get_read_batch(RDMAManager& rdma_mgr, const std::vector<GlobalAddress>& gaddrs, std::vector<T>& objs, std::vector<RDMAOp>& ops) {
     objs.resize(gaddrs.size());
     for (size_t i = 0; i < gaddrs.size(); ++i) {
         ops.push_back(RDMAOp{RDMAOpType::READ, gaddrs[i]});
         ops.back().op.read.buffer = reinterpret_cast<uint8_t*>(&objs[i]);
         ops.back().op.read.bytes = sizeof(T);
     }
+}
+
+template<typename T>
+void get_write_batch(RDMAManager& rdma_mgr, const std::vector<GlobalAddress>& gaddrs, const std::vector<T>& objs, std::vector<RDMAOp>& ops) {
+    for (size_t i = 0; i < gaddrs.size(); ++i) {
+        ops.push_back(RDMAOp{RDMAOpType::WRITE, gaddrs[i]});
+        ops.back().op.write.buffer = reinterpret_cast<const uint8_t*>(&objs[i]);
+        ops.back().op.write.bytes = sizeof(T);
+    }
+}
+
+template<typename T>
+bool rdma_read_batch(RDMAManager& rdma_mgr, const std::vector<GlobalAddress>& gaddrs, std::vector<T>& objs) {
+    std::vector<RDMAOp> ops;
+    get_read_batch(rdma_mgr, gaddrs, objs, ops);
+    return rdma_mgr.perform_batch(ops);
+}
+
+template<typename T>
+bool rdma_write_batch(RDMAManager& rdma_mgr, const std::vector<GlobalAddress>& gaddrs, const std::vector<T>& objs) {
+    std::vector<RDMAOp> ops;
+    get_write_batch(rdma_mgr, gaddrs, objs, ops);
     return rdma_mgr.perform_batch(ops);
 }
 
