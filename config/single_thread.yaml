@@ -15,7 +15,7 @@ cpu_binding_enabled: false
 cpu_binding_start_core: 0
 cpu_isolation_required: false
 distribution:
-  type: skewed
+  type: uniform
   key_space: 10000000
 operation_mix:
   insert: 1.0
@@ -25,5 +25,6 @@ operation_mix:
 # ycsb_workload: a
 cache:
   enabled: true
-  max_size_kb: 16384
+  max_size_kb: 32768
+  max_mcs_size_kb: 16384
 index: "faunus"

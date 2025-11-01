@@ -167,7 +167,6 @@ int main(int argc, char* argv[]) {
 
         auto init_index = make_index(rdma_mgr, local_allocator, 0, nullptr, nullptr);
         init_index->initialize(num_maintenance_cs);
-        // KVIndex::get_root_offset_pointer() is part of the KVIndex interface — call directly
         root_offset_ptr = init_index->get_root_offset_pointer();
         LOG_INFO("Initialized index with root at global address " << std::hex << root_offset_ptr << std::dec);
     }
@@ -176,12 +175,14 @@ int main(int argc, char* argv[]) {
     // Create caches per maintenance compute server (shared among threads in the same CS)
     std::vector<std::shared_ptr<IndexCacheBase>> mcs_caches(num_maintenance_cs);
     
-    for (size_t mcs_id = 0; mcs_id < num_cs; ++mcs_id) {
-        LOG_INFO("Setting up cache for MCS " << mcs_id);
-        // Create cache using the factory method from a sample index
-        auto sample_index = make_index(rdma_mgr, nullptr, 0, nullptr, nullptr);
-        // mcs_caches[mcs_id] = sample_index->create_cache(64 * 1024 * 1024); // 64MB
-        LOG_INFO("Created cache for MCS " << mcs_id << " targeting level 2");
+    if (config.use_cache) {
+        for (size_t mcs_id = 0; mcs_id < num_maintenance_cs; ++mcs_id) {
+            LOG_INFO("Setting up cache for MCS " << mcs_id);
+            // Create cache using the factory method from a sample index
+            auto sample_index = make_index(rdma_mgr, nullptr, 0, nullptr, nullptr);
+            mcs_caches[mcs_id] = sample_index->create_cache(config.max_mcs_cache_size_kb * 1024);
+            LOG_INFO("Created cache for MCS " << mcs_id << " targeting level 2");
+        }
     }
 
     LOG_INFO("Launching " << num_maintenance_cs << " maintenance compute servers, " << threads_per_maintenance_cs << " threads each.");
@@ -192,10 +193,22 @@ int main(int argc, char* argv[]) {
         auto local_allocator = std::make_shared<LocalAllocator>(sizes, initial_slabs_per_size, rpc_allocator);
         // TODO: for some reason MCS caches makes stuff REAL slow
         auto cache = mcs_caches[mcs_id];
-        // auto cache = nullptr;
+        if (!config.use_cache) {
+            cache = nullptr;
+        }
 
         auto maintenance_worker = [mcs_id, root_offset_ptr, cache, &make_index, local_lock_mgr = mcs_local_lock_mgrs[mcs_id]](size_t tid, ThreadStats& stat, std::shared_ptr<RDMAManager> rdma_mgr, std::shared_ptr<LocalAllocator> allocator) {
+            // Create thread-local enhanced statistics tracker for maintenance operations
+            ThreadStatsTracker stats_tracker(stat);
+            
+            // Set the stats tracker on RDMAManager for automatic RDMA operation tracking
+            RDMAManager::set_thread_stats_tracker(&stats_tracker);
+            
             auto index = make_index(rdma_mgr, allocator, root_offset_ptr, cache, local_lock_mgr);
+            
+            // Set the stats tracker for cache hit/miss tracking during maintenance
+            index->set_stats_tracker(&stats_tracker);
+            
             // if the index implementation provides a maintenance_worker override, call it
             index->maintenance_worker(mcs_id, tid);
         };
@@ -256,7 +269,6 @@ int main(int argc, char* argv[]) {
             cache = nullptr;
         }
 
-	    std::cout << "Using cache? " << (cache != nullptr) << std::endl;
         auto worker = [cs_id, root_offset_ptr, &op_picker, &worker_summaries, &warmup_counter, &warmup_mutex, &warmup_cv, total_clients,
                        ops_per_client, warmup_total, &config, cache, &benchmark_start, &make_index, local_lock_mgr = cs_local_lock_mgrs[cs_id]](int tid, ThreadStats& stat,
                                               std::shared_ptr<RDMAManager> rdma_mgr,
@@ -348,8 +360,6 @@ int main(int argc, char* argv[]) {
             for (size_t op_idx = 0; op_idx < ops_per_client; ++op_idx) {
                 OperationKind desired = op_picker.weighted_pick(op_rng);
                 
-                // Simplify: treat insert/update/delete all as PUT (insert-or-update)
-                // Only GET and PUT operations now, no complex state tracking needed
                 bool success = false;
                 Key key = sample_global_key();  // Always sample from global key space
                 
@@ -476,49 +486,37 @@ int main(int argc, char* argv[]) {
     size_t total_cache_evictions = 0;
     size_t total_invalid_ranges = 0;
     
-    // Collect cache statistics from ThreadStats (per-thread tracking)
-    for (size_t cs_id = 0; cs_id < compute_servers.size(); ++cs_id) {
-        for (size_t tid = 0; tid < threads_per_cs; ++tid) {
-            const auto& thread_stat = compute_servers[cs_id]->get_thread_stats()[tid];
-            for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
-                const auto& entry = thread_stat.per_op[op_idx];
-                total_cache_hits += entry.cache_stats.hits();
-                total_cache_misses += entry.cache_stats.misses();
-            }
-        }
-    }
-    
-    // TODO: are the caches stats global for all CSs?
-    // for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
-    //     auto cache_stats = cs_caches[cs_id]->get_stats();
-    //     total_cache_hits += cache_stats.hits;
-    //     total_cache_misses += cache_stats.misses;
-    //     total_cache_entries += cache_stats.entries;
-    //     total_cache_evictions += cache_stats.evictions;
-    //     total_invalid_ranges += cache_stats.invalid_ranges;
-        
-    //     std::cout << "CS " << cs_id << " cache: hits=" << cache_stats.hits 
-    //               << ", misses=" << cache_stats.misses 
-    //               << ", hit_rate=" << std::fixed << std::setprecision(3) << cache_stats.hit_rate()
-    //               << ", entries=" << cache_stats.entries
-    //               << ", evictions=" << cache_stats.evictions 
-    //               << ", invalid_ranges=" << cache_stats.invalid_ranges << std::endl;
+    // // Collect cache statistics from ThreadStats (per-thread tracking)
+    // for (size_t cs_id = 0; cs_id < compute_servers.size(); ++cs_id) {
+    //     for (size_t tid = 0; tid < threads_per_cs; ++tid) {
+    //         const auto& thread_stat = compute_servers[cs_id]->get_thread_stats()[tid];
+    //         for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
+    //             const auto& entry = thread_stat.per_op[op_idx];
+    //             total_cache_hits += entry.cache_stats.hits();
+    //             total_cache_misses += entry.cache_stats.misses();
+    //             std::cout << "CS " << cs_id << " Thread " << tid << " Op " << op_idx
+    //                       << " Cache hits=" << entry.cache_stats.hits()
+    //                       << ", misses=" << entry.cache_stats.misses()
+    //                       << ", hit_rate=" << std::fixed << std::setprecision(3) << entry.cache_stats.hit_rate()
+    //                       << std::defaultfloat << std::endl;
+    //         }
+    //     }
     // }
     
-    // for (size_t mcs_id = 0; mcs_id < num_maintenance_cs; ++mcs_id) {
-    //     auto cache_stats = mcs_caches[mcs_id]->get_stats();
-    //     total_cache_hits += cache_stats.hits;
-    //     total_cache_misses += cache_stats.misses;
-    //     total_cache_entries += cache_stats.entries;
-    //     total_cache_evictions += cache_stats.evictions;
-    //     total_invalid_ranges += cache_stats.invalid_ranges;
-        
-    //     std::cout << "MCS " << mcs_id << " cache: hits=" << cache_stats.hits 
-    //               << ", misses=" << cache_stats.misses 
-    //               << ", hit_rate=" << std::fixed << std::setprecision(3) << cache_stats.hit_rate()
-    //               << ", entries=" << cache_stats.entries
-    //               << ", evictions=" << cache_stats.evictions 
-    //               << ", invalid_ranges=" << cache_stats.invalid_ranges << std::endl;
+    // for (size_t mcs_id = 0; mcs_id < maintenance_compute_servers.size(); ++mcs_id) {
+    //     for (size_t tid = 0; tid < threads_per_maintenance_cs; ++tid) {
+    //         const auto& thread_stat = maintenance_compute_servers[mcs_id]->get_thread_stats()[tid];
+    //         for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
+    //             const auto& entry = thread_stat.per_op[op_idx];
+    //             total_cache_hits += entry.cache_stats.hits();
+    //             total_cache_misses += entry.cache_stats.misses();
+    //             std::cout << "MCS " << mcs_id << " Thread " << tid << " Op " << op_idx
+    //                       << " Cache hits=" << entry.cache_stats.hits()
+    //                       << ", misses=" << entry.cache_stats.misses()
+    //                       << ", hit_rate=" << std::fixed << std::setprecision(3) << entry.cache_stats.hit_rate()
+    //                       << std::defaultfloat << std::endl;
+    //         }
+    //     }
     // }
 
     double overall_hit_rate = (total_cache_hits + total_cache_misses) == 0 ? 0.0 : 
