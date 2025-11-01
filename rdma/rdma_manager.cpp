@@ -50,18 +50,18 @@ uint64_t RDMAManager::calculate_bw_delay_ns(const RDMAOp& op) const {
 
 // Private helper to execute mapped RDMA operation
 bool RDMAManager::execute_rdma(RDMAOp& op) {
-    Profiler::Scoped scope("rdma.execute");
+    // Profiler::Scoped scope("rdma.execute");
     // LOG_DEBUG("Executing RDMA operation: type=" << static_cast<int>(op.type) << ", gaddr=" << std::hex << static_cast<GlobalAddress>(op.addr).raw << std::dec);
+    RDMAOp local_op = op;
     size_t local_addr;
     auto server = get_server(op.addr, local_addr);
     if (!server) return false;
-    RDMAOp local_op = op;
     local_op.addr = local_addr;
     bool result = false;
     switch (op.type) {
         case RDMAOpType::READ:
             {
-                Profiler::Scoped op_scope("rdma.execute.read");
+                // Profiler::Scoped op_scope("rdma.execute.read");
                 // std::cout << "will read" << std::endl;
                 result = server->get_rdma().rdma_read(local_op);
                 // std::cout << "read results = " << result << std::endl;
@@ -70,19 +70,19 @@ bool RDMAManager::execute_rdma(RDMAOp& op) {
         case RDMAOpType::WRITE:
             {
                 // std::cout << "Writing to " << op.addr << ", bytes: " << op.op.write.bytes << std::endl;
-                Profiler::Scoped op_scope("rdma.execute.write");
+                // Profiler::Scoped op_scope("rdma.execute.write");
                 result = server->get_rdma().rdma_write(local_op);
             }
             break;
         case RDMAOpType::CAS:
             {
-                Profiler::Scoped op_scope("rdma.execute.cas");
+                // Profiler::Scoped op_scope("rdma.execute.cas");
                 result = server->get_rdma().rdma_cas(local_op);
             }
             break;
         case RDMAOpType::FAA:
             {
-                Profiler::Scoped op_scope("rdma.execute.faa");
+                // Profiler::Scoped op_scope("rdma.execute.faa");
                 server->get_rdma().rdma_faa(local_op);
                 result = true;
             }
@@ -115,18 +115,26 @@ RDMAManager::RDMAManager(const std::vector<std::shared_ptr<MemoryServer>>& mem_s
 }
 
 std::shared_ptr<MemoryServer> RDMAManager::get_server(const GlobalAddress& gaddr, size_t& local_addr) {
-    Profiler::Scoped scope("rdma.get_server");
+    // Profiler::Scoped scope("rdma.get_server");
     uint8_t server_id = gaddr.server_index();
     local_addr = gaddr.offset();
+    
     if (server_id < mem_servers_.size()) {
         return mem_servers_[server_id];
     }
+    
     return nullptr;
 }
 
 
 bool RDMAManager::perform_op(RDMAOp& op) {
-    Profiler::Scoped scope("rdma.perform_op");
+    // Profiler::Scoped scope("rdma.perform_op");
+    
+    // Debug check: ensure op.addr is a valid global address (server_index < num_servers)
+    #ifndef NDEBUG
+    uint8_t server_id = op.addr.server_index();
+    assert(server_id < mem_servers_.size() && "RDMAOp.addr must be a valid global address");
+    #endif
 
     // First RTT half
     size_t local_addr;
@@ -138,8 +146,10 @@ bool RDMAManager::perform_op(RDMAOp& op) {
     util::precise_sleep_ns(one_way_ns);
 
     // acquiring simulates contention delay
-    auto [server_lock, contention_ns] = acquire_server_lock(server);
-    server_lock.unlock();
+    // auto [server_lock, contention_ns] = acquire_server_lock(server);
+    // server_lock.unlock();
+    // TODO: THIS SERIALIZES EVERYTHING - MAY BE VERY BAD
+    const uint64_t contention_ns = 0; // TODO: set contention_ns from above
 
     const uint64_t bw_delay_ns = calculate_bw_delay_ns(op);
 
@@ -167,26 +177,13 @@ bool RDMAManager::perform_op(RDMAOp& op) {
 
 
 bool RDMAManager::perform_batch(std::vector<RDMAOp>& ops) {
-    // Profiler::Scoped scope("rdma.perform_batch");
-    // LOG_DEBUG("Performing batch of size " << ops.size());
-    // util::precise_sleep_us(base_rtt_us_ / 2.0);
-    // for (auto op : ops) {
-    //     if (!execute_rdma(op)) {
-    //         return false;
-    //     }
-    // }
-    // util::precise_sleep_us(base_rtt_us_ / 2.0);
-    // auto& stats = ensure_thread_stats();
-    // for (auto op : ops) {
-    //     stats.op_counts[static_cast<size_t>(op.type)]++;
-    //     stats.total_rtt_ns++;
-    // }
-
     if (ops.empty()) {
         return true;
     }
 
-    Profiler::Scoped scope("rdma.perform_batch");
+    // Debug check: ensure all ops have valid global addresses
+
+    // Profiler::Scoped scope("rdma.perform_batch");
     auto& stats = ensure_thread_stats();
     
     // 1. Simulate Batch Issue Time (Wall-clock sleep for the outgoing trip)
@@ -205,14 +202,19 @@ bool RDMAManager::perform_batch(std::vector<RDMAOp>& ops) {
     for (RDMAOp& op : ops) {
         size_t local_addr;
         auto server = get_server(op.addr, local_addr);
-        if (!server) return false;
+        if (!server) {
+            std::cout << "Failed to get server for RDMAOp: " << (int)op.type << " " << op.addr << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            return false;
+        }
 
         // --- Contention Measurement (Control Plane Handshake) ---
         // Acquire lock just to measure wait time, then release immediately.
         // This models the contention for the server's control-plane resource.
         // TODO: we acquire in a serial manner, assert that this is acceptable
-        auto [server_lock, contention_ns] = acquire_server_lock(server);
-        server_lock.unlock(); // Release immediately (crucial fix)
+        // auto [server_lock, contention_ns] = acquire_server_lock(server);
+        // server_lock.unlock(); // Release immediately (crucial fix)
+        uint64_t contention_ns = 0; // TODO: set contention_ns from above
 
         // --- Execution Latency (BW Delay) ---
         uint64_t bw_delay_ns = calculate_bw_delay_ns(op);
@@ -223,8 +225,12 @@ bool RDMAManager::perform_batch(std::vector<RDMAOp>& ops) {
         // --- Execution Phase (Local Copy) ---
         RDMAOp local_op = op;
         local_op.addr = local_addr;
-        bool result = execute_rdma(local_op); // Instantaneous local execution
-        if (!result) return false;
+        bool result = execute_rdma(op); // Instantaneous local execution
+        if (!result) {
+            std::cout << "RDMAOp failed: " << (int)op.type << " " << op.addr << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            return false;
+        }
 
         // --- RTT and Stats Update ---
         uint64_t op_return_trip_ns = 0;
@@ -282,6 +288,7 @@ RDMAManager::RDMAStats RDMAManager::collect_stats() const {
         stats.total_rtt_ns += total;
         stats.per_thread.push_back(std::move(snapshot));
     }
+    
     return stats;
 }
 
@@ -297,7 +304,7 @@ void RDMAManager::reset_stats() {
 }
 
 bool rdma_try_acquire_lock(RDMAManager& rdma_mgr, GlobalAddress lock_address) {
-    Profiler::Scoped scope("rdma.try_acquire_lock");
+    // Profiler::Scoped scope("rdma.try_acquire_lock");
     uint64_t expected = 0;
     uint64_t desired = 1;
 
@@ -312,7 +319,7 @@ bool rdma_try_acquire_lock(RDMAManager& rdma_mgr, GlobalAddress lock_address) {
 }
 
 bool rdma_release_lock(RDMAManager& rdma_mgr, GlobalAddress lock_address) {
-    Profiler::Scoped scope("rdma.release_lock");
+    // Profiler::Scoped scope("rdma.release_lock");
     RDMAOp op{RDMAOpType::FAA, lock_address};
     op.op.faa.increment = -1;
 
