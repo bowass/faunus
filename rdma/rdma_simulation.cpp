@@ -10,14 +10,13 @@ RDMASimulation::RDMASimulation(size_t memory_size)
 
 
 bool RDMASimulation::rdma_read(RDMAOp& op) {
-    Profiler::Scoped scope("rdma.read");
     assert(op.type == RDMAOpType::READ);
     
     if (op.addr + op.op.read.bytes > memory_.size() || !op.op.read.buffer) {
         assert(false);
         return false;
     }
-    
+
     std::copy(memory_.begin() + op.addr, memory_.begin() + op.addr + op.op.read.bytes, op.op.read.buffer);
     
     return true;
@@ -25,30 +24,21 @@ bool RDMASimulation::rdma_read(RDMAOp& op) {
 
 
 bool RDMASimulation::rdma_write(RDMAOp& op) {
-    Profiler::Scoped scope("rdma.write");
     assert(op.type == RDMAOpType::WRITE);
     
     if (op.addr + op.op.write.bytes > memory_.size() || !op.op.write.buffer) {
         return false;
     }
-    
-    // std::cout << "RDMA_WRITE to " << std::hex << op.addr << " size " << std::dec << op.op.write.bytes << ", data: ";
-    // for (size_t i = 0; i < std::min(op.op.write.bytes, size_t(32)); ++i) {
-    //     std::cout << std::hex << static_cast<int>(op.op.write.buffer[i]) << " ";
-    // }
-    // std::cout << std::endl;
+
     std::copy(op.op.write.buffer, op.op.write.buffer + op.op.write.bytes, memory_.begin() + op.addr);
-    // std::cout << "Done write." << std::endl;
 
     return true;
 }
 
 
 bool RDMASimulation::rdma_cas(RDMAOp& op) {
-    Profiler::Scoped scope("rdma.cas");
     assert(op.type == RDMAOpType::CAS);
 
-    // std::cout << "RDMA_CAS to " << std::hex << op.addr << ", expected: " << std::hex << *reinterpret_cast<uint64_t*>(op.op.cas.expected) << ", desired: " << std::hex << op.op.cas.desired << std::endl;
     if (op.addr + sizeof(uint64_t) > memory_.size()) {
         return false;
     }
@@ -61,7 +51,6 @@ bool RDMASimulation::rdma_cas(RDMAOp& op) {
 
 
 uint64_t RDMASimulation::rdma_faa(RDMAOp& op) {
-    Profiler::Scoped scope("rdma.faa");
     assert(op.type == RDMAOpType::FAA);
     
     uint64_t old = 0;

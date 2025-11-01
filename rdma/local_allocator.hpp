@@ -36,7 +36,7 @@ public:
     }
     // Allocate a chunk, with exponential growth if needed
     int64_t allocate_nogrowth() {
-        Profiler::Scoped scope("SlabAllocator::allocate_nogrowth");
+        // Profiler::Scoped scope("SlabAllocator::allocate_nogrowth");
         int64_t offset;
         if (free_list_.try_dequeue(offset)) {
             return offset;
@@ -44,7 +44,7 @@ public:
         return -1; // No free slab available
     }
     int64_t allocate() {
-        Profiler::Scoped scope("SlabAllocator::allocate");
+        // Profiler::Scoped scope("SlabAllocator::allocate");
         int64_t offset;
         if (free_list_.try_dequeue(offset)) {
             return offset;
@@ -52,6 +52,7 @@ public:
         // No free slab available: try to grow, but serialize growth to
         // avoid multiple threads performing expensive backing allocations.
         std::lock_guard<std::mutex> growth_lock(growth_mu_);
+        // std::cout << "growing! num_slabs: " << num_slabs_ << ", slab_size_: " << slab_size_ << std::endl;
         // After acquiring the growth lock, try dequeue again in case
         // another thread already grew the slab.
         if (free_list_.try_dequeue(offset)) {
@@ -67,7 +68,7 @@ public:
     }
     // Free a chunk by offset
     void free(int64_t offset) {
-        Profiler::Scoped scope("SlabAllocator::free");
+        // Profiler::Scoped scope("SlabAllocator::free");
         free_list_.enqueue(offset);
     }
     size_t free_count() const { return free_list_.size_approx(); }
@@ -112,25 +113,17 @@ public:
     LocalAllocator(const std::set<size_t>& sizes, size_t num_chunks_per_slab, std::shared_ptr<Allocator> allocator)
         : allocator_(allocator) {
         for (auto sz : sizes) {
-            // LOG_DEBUG("Creating slab for size " << sz << " at " << this);
             slabs_[sz] = std::make_unique<SlabAllocator>(sz, num_chunks_per_slab, allocator);
         }
     }
     // Thread-safe allocation for a given size
     // TODO: is map thread-safe? are the allocate() and free() in SlabAllocator thread-safe?
     int64_t allocate(size_t size) {
-        // LOG_DEBUG("Slabs at " << this);
         auto it = slabs_.find(size);
         if (it == slabs_.end()) {
-            // LOG_ERROR("[LocalAllocator] No slab for size " << size);
             return -1;
         }
-        // LOG_DEBUG("[LocalAllocator] Allocating size " << size);
-        int64_t result = it->second->allocate();
-        if (result == -1) {
-            // LOG_ERROR("[LocalAllocator] Allocation failed for size " << size);
-        }
-        return result;
+        return it->second->allocate();
     }
     // Thread-safe free for a given size
     void free(size_t size, int64_t offset) {
