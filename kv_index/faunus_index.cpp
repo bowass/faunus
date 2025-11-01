@@ -376,6 +376,16 @@ bool FaunusIndex::read(const Key& key, Value& value_out) {
     return false;    
 }
 
+// Lightweight 64-bit mixer (to avoid correlated seeds)
+static inline uint64_t mix64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
 bool FaunusIndex::insert(const Key& key, const Value& value) {
     bool success;
     bool wrote_kvitem = false;
@@ -457,27 +467,25 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
             }
         }
 
-        // TODO: collect all free entries and go in the order based on client
-        // std::vector<std::pair<size_t, KVBlock>> free_kvbs;
-        // for (size_t i = 0; i < branch_factor; i++) {
-
-        // }
+        const uint64_t tid_hash = (uint64_t)std::hash<std::thread::id>{}(std::this_thread::get_id());
+        uint64_t seed = mix64(tid_hash ^ attempt);
 
         bool found_free = false;
         success = false;
         for (size_t i = 0; !found_free && (i < branch_factor); i++) {
-            // the re-read leaf contained a locked KVBlock
+            // each thread traverses the entries in a different order based on its id
+            size_t index = (i ^ seed) & (branch_factor - 1);
             // break to continue in the mainloop
-            if (leaf.kv_blocks[i].isLocked()) {
+            if (leaf.kv_blocks[index].isLocked()) {
                 break;
             }
-            if (leaf.kv_blocks[i].isFree()) {
+            if (leaf.kv_blocks[index].isFree()) {
                 found_free = true;
                 // update KVBlock using CAS and re-read the leaf back-to-back
-                GlobalAddress kvblock_address = leaf_address + OFFSET_OF_ARRAY_ELEM(LeafNode, kv_blocks, i);
+                GlobalAddress kvblock_address = leaf_address + OFFSET_OF_ARRAY_ELEM(LeafNode, kv_blocks, index);
                 std::vector<RDMAOp> ops;
                 ops.push_back(RDMAOp{RDMAOpType::CAS, kvblock_address});
-                uint64_t expected = leaf.kv_blocks[i].raw;
+                uint64_t expected = leaf.kv_blocks[index].raw;
                 ops.back().op.cas.expected = reinterpret_cast<uint64_t>(&expected);
                 ops.back().op.cas.desired = kvb.raw;
 
@@ -644,24 +652,25 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
 
     // Read all KVItems in the leaf
     std::vector<GlobalAddress> item_pointers;
+    std::vector<size_t> taken_indices;
     for (size_t i = 0; i < branch_factor; i++) {
         assert(leaf.kv_blocks[i].isLocked());
         if (!leaf.kv_blocks[i].isFree()) {
             item_pointers.push_back(leaf.kv_blocks[i].getAddr());
+            taken_indices.push_back(i);
         }
     }
 
     // Assuming Key is first in KVItem - reading keys only
     std::vector<Key> leaf_keys;
     if (!rdma_read_batch(*rdma_mgr_, item_pointers, leaf_keys)) {
-        std::cout << leaf << std::endl;
         assert(false);
     }
 
     // Remove duplicate keys and sort
     std::map<Key, KVBlock> entries_map;
     for (size_t i = 0; i < leaf_keys.size(); i++) {
-        entries_map[leaf_keys[i]] = leaf.kv_blocks[i];
+        entries_map[leaf_keys[i]] = leaf.kv_blocks[taken_indices[i]];
     }
 
     // Test - validating fence
@@ -670,6 +679,10 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
     }
 
     std::vector<std::pair<Key, KVBlock>> entries(entries_map.begin(), entries_map.end());
+
+    for (int i = 0; i < entries.size() - 1; i++) {
+        assert(entries[i].first < entries[i + 1].first);
+    }
 
     if (entries.size() <= branch_factor / 2) {
         // release kvblocks and node
