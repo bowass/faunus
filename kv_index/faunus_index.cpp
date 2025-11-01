@@ -384,7 +384,6 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
     KVItem kvitem{key, value};
     GlobalAddress leaf_address;
     GlobalAddress kvitem_address = allocator_->allocate(sizeof(KVItem));
-    assert(kvitem_address.server_index() < 2);
     KVBlock kvb{fp, kvitem_address, false, false};
     LeafNode leaf;
     Entry<Key, FaunusCacheItem>* cached_entry = nullptr;
@@ -698,9 +697,6 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
     // Update fences
     new_leaf.header.fence = {middle_key, leaf.header.fence.second};
     leaf.header.fence.second = middle_key;
-
-    // TODO: .sibling usage???
-    // if did not find any, remove .sibling property
 
     // Write sibling leaf first
     success = rdma_write_object(*rdma_mgr_, new_leaf_address, new_leaf);
@@ -1082,7 +1078,7 @@ void FaunusIndex::print_tree(size_t offset, int depth, bool show_kv) {
     }
     std::cout << std::setw(depth * 2) << " " << "Node @ offset 0x" << std::hex << offset << std::dec << ": level=" << node.header.level
               << ", lock=" << node.header.lock << ", fence=[" << node.header.fence.first << ", " << node.header.fence.second << "]"
-              << ", last_index=" << node.header.last_index << ", sibling=" << node.header.sibling << std::endl;
+              << ", last_index=" << node.header.last_index << std::endl;
     for (size_t i = 0; i <= node.header.last_index && i < branch_factor; ++i) {
         std::cout << std::setw(depth * 2 + 2) << " " << "Entry " << i << ": key=" << node.entries[i].key << ", child=" << node.entries[i].child << std::endl;
     }

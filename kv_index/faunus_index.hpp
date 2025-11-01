@@ -93,11 +93,10 @@ namespace faunus_index_internal {
         uint64_t level;
         std::pair<Key, Key> fence;
         uint64_t last_index;
-        GlobalAddress sibling;
     };
 
     inline std::ostream& operator<<(std::ostream& os, const Header& hdr) {
-        os << "Header(lock=" << hdr.lock << ", level=" << hdr.level << ", fence=(" << hdr.fence.first << ", " << hdr.fence.second << "), last_index=" << hdr.last_index << ", sibling=" << hdr.sibling << ")";
+        os << "Header(lock=" << hdr.lock << ", level=" << hdr.level << ", fence=(" << hdr.fence.first << ", " << hdr.fence.second << "), last_index=" << hdr.last_index << ")";
         return os;
     }
 
