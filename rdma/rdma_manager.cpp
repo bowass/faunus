@@ -51,7 +51,7 @@ uint64_t RDMAManager::calculate_bw_delay_ns(const RDMAOp& op) const {
 // Private helper to execute mapped RDMA operation
 bool RDMAManager::execute_rdma(RDMAOp& op) {
     // Profiler::Scoped scope("rdma.execute");
-    LOG_DEBUG("Executing RDMA operation: type=" << static_cast<int>(op.type) << ", gaddr=" << std::hex << static_cast<GlobalAddress>(op.addr).raw << std::dec);
+    // LOG_DEBUG("Executing RDMA operation: type=" << static_cast<int>(op.type) << ", gaddr=" << std::hex << static_cast<GlobalAddress>(op.addr).raw << std::dec);
     RDMAOp local_op = op;
     size_t local_addr;
     auto server = get_server(op.addr, local_addr);
@@ -133,7 +133,7 @@ bool RDMAManager::perform_op(RDMAOp& op) {
     // Debug check: ensure op.addr is a valid global address (server_index < num_servers)
     #ifndef NDEBUG
     uint8_t server_id = op.addr.server_index();
-    assert(server_id < mem_servers_.size() && "RDMAOp.addr must be a valid global address");
+    assert(server_id < mem_servers_.size());
     #endif
 
     // First RTT half
@@ -312,9 +312,9 @@ bool rdma_try_acquire_lock(RDMAManager& rdma_mgr, GlobalAddress lock_address) {
     op.op.cas.expected = reinterpret_cast<uint64_t>(&expected);
     op.op.cas.desired = desired;
 
-    if (!rdma_mgr.perform_op(op)) {
-        assert(false);
-    }
+    assert(rdma_mgr.perform_op(op));
+
+    // CAS succeeded if the expected value was indeed 0 (unlocked)
     return expected == 0;
 }
 
@@ -325,4 +325,17 @@ bool rdma_release_lock(RDMAManager& rdma_mgr, GlobalAddress lock_address) {
 
     // return value of FAA is the previous value
     return rdma_mgr.perform_op(op) == 1;
+}
+
+// CAS-based lock release for Sherman-style tagged locks
+bool rdma_cas_release_lock(RDMAManager& rdma_mgr, GlobalAddress lock_address) {
+    // For releasing a lock we own, use unconditional WRITE to set it to 0
+    // This is safe because we hold the lock, so no one else should be modifying it
+    // READ+CAS approach has a race condition where lock could change between READ and CAS
+    RDMAOp op{RDMAOpType::WRITE, lock_address};
+    static uint64_t zero = 0;
+    op.op.write.buffer = reinterpret_cast<const uint8_t*>(&zero);
+    op.op.write.bytes = sizeof(uint64_t);
+    
+    return rdma_mgr.perform_op(op);
 }

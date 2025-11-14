@@ -159,3 +159,6 @@ bool rdma_write_batch(RDMAManager& rdma_mgr, const std::vector<GlobalAddress>& g
 bool rdma_try_acquire_lock(RDMAManager& rdma_mgr, GlobalAddress lock_address);
 
 bool rdma_release_lock(RDMAManager& rdma_mgr, GlobalAddress lock_address);
+
+// CAS-based lock release for Sherman-style tagged locks
+bool rdma_cas_release_lock(RDMAManager& rdma_mgr, GlobalAddress lock_address);
