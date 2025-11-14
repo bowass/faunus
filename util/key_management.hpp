@@ -98,18 +98,19 @@ inline Key encode_key(uint64_t client_id, uint64_t sequence) {
  */
 template<typename RNG>
 inline Key sample_key_from_global_space(RNG& rng, const util::KeySelectionSampler& sampler, size_t key_space_size) {
-    size_t key_index = sampler.sample(rng);
-    if (key_index >= key_space_size) {
-        key_index = key_index % key_space_size;  // Wrap around for safety
-    }
-    
     Key key{};
-    // Use a different hash than encode_key to avoid correlation
-    uint64_t raw = key_index * 0x517CC1B727220A95ULL;
-    for (size_t i = 0; i < key.size(); ++i) {
-        key.data()[i] = static_cast<uint8_t>(raw & 0xFF);
-        raw = (raw >> 8) | (raw << 56);
-    }
+    do {
+        size_t key_index = sampler.sample(rng);
+        if (key_index >= key_space_size) {
+            key_index = key_index % key_space_size;  // Wrap around for safety
+        }
+        // Use a different hash than encode_key to avoid correlation
+        uint64_t raw = key_index * 0x517CC1B727220A95ULL;
+        for (size_t i = 0; i < key.size(); ++i) {
+            key.data()[i] = static_cast<uint8_t>(raw & 0xFF);
+            raw = (raw >> 8) | (raw << 56);
+        }
+    } while (key == Key::min() || key == Key::max());
     return key;
 }
 
@@ -119,10 +120,12 @@ inline Key sample_key_from_global_space(RNG& rng, const util::KeySelectionSample
 inline Value generate_random_value(std::mt19937_64& gen) {
     // Profiler::Scoped timer("client.generate_value");
     Value value;
-    std::uniform_int_distribution<uint8_t> dis(0, 255);
-    for (size_t i = 0; i < value.size(); ++i) {
-        value.data()[i] = dis(gen);
-    }
+    do {
+        std::uniform_int_distribution<uint8_t> dis(0, 255);
+        for (size_t i = 0; i < value.size(); ++i) {
+            value.data()[i] = dis(gen);
+        }
+    } while (value == Value::min());
     return value;
 }
 
