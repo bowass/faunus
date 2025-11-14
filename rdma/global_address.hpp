@@ -17,10 +17,10 @@ struct GlobalAddress {
     operator uint8_t*() const { return reinterpret_cast<uint8_t*>(raw); }
 
     static GlobalAddress Null() { return GlobalAddress(0); }
-    bool operator==(const GlobalAddress& other) {
+    bool operator==(const GlobalAddress& other) const {
         return raw == other.raw;
     }
-    bool operator!=(const GlobalAddress& other) {
+    bool operator!=(const GlobalAddress& other) const {
         return !(raw == other.raw);
     }
 } __attribute__((packed));
