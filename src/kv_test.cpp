@@ -135,9 +135,10 @@ int main(int argc, char* argv[]) {
     std::vector<std::shared_ptr<local_locks::LocalLockManager>> mcs_local_lock_mgrs(num_maintenance_cs);
     
     for (size_t cs_id = 0; cs_id < num_cs; ++cs_id) {
-        // cs_local_lock_mgrs[cs_id] = std::make_shared<local_locks::LocalLockManager>();
-        cs_local_lock_mgrs[cs_id] = nullptr; // TODO: disabling local locks for debug
-        LOG_INFO("Created local lock manager for CS " << cs_id);
+        // Re-enable local locks with corrected Sherman algorithm
+        cs_local_lock_mgrs[cs_id] = std::make_shared<local_locks::LocalLockManager>(num_ms); 
+        // cs_local_lock_mgrs[cs_id] = nullptr;
+        LOG_INFO("Sherman local locks ENABLED for CS " << cs_id << " (fixed bit extraction)");
     }
     
     for (size_t mcs_id = 0; mcs_id < num_maintenance_cs; ++mcs_id) {
@@ -486,38 +487,38 @@ int main(int argc, char* argv[]) {
     size_t total_cache_evictions = 0;
     size_t total_invalid_ranges = 0;
     
-    // // Collect cache statistics from ThreadStats (per-thread tracking)
-    // for (size_t cs_id = 0; cs_id < compute_servers.size(); ++cs_id) {
-    //     for (size_t tid = 0; tid < threads_per_cs; ++tid) {
-    //         const auto& thread_stat = compute_servers[cs_id]->get_thread_stats()[tid];
-    //         for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
-    //             const auto& entry = thread_stat.per_op[op_idx];
-    //             total_cache_hits += entry.cache_stats.hits();
-    //             total_cache_misses += entry.cache_stats.misses();
-    //             std::cout << "CS " << cs_id << " Thread " << tid << " Op " << op_idx
-    //                       << " Cache hits=" << entry.cache_stats.hits()
-    //                       << ", misses=" << entry.cache_stats.misses()
-    //                       << ", hit_rate=" << std::fixed << std::setprecision(3) << entry.cache_stats.hit_rate()
-    //                       << std::defaultfloat << std::endl;
-    //         }
-    //     }
-    // }
+    // Collect cache statistics from ThreadStats (per-thread tracking)
+    for (size_t cs_id = 0; cs_id < compute_servers.size(); ++cs_id) {
+        for (size_t tid = 0; tid < threads_per_cs; ++tid) {
+            const auto& thread_stat = compute_servers[cs_id]->get_thread_stats()[tid];
+            for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
+                const auto& entry = thread_stat.per_op[op_idx];
+                total_cache_hits += entry.cache_stats.hits();
+                total_cache_misses += entry.cache_stats.misses();
+                std::cout << "CS " << cs_id << " Thread " << tid << " Op " << op_idx
+                          << " Cache hits=" << entry.cache_stats.hits()
+                          << ", misses=" << entry.cache_stats.misses()
+                          << ", hit_rate=" << std::fixed << std::setprecision(3) << entry.cache_stats.hit_rate()
+                          << std::defaultfloat << std::endl;
+            }
+        }
+    }
     
-    // for (size_t mcs_id = 0; mcs_id < maintenance_compute_servers.size(); ++mcs_id) {
-    //     for (size_t tid = 0; tid < threads_per_maintenance_cs; ++tid) {
-    //         const auto& thread_stat = maintenance_compute_servers[mcs_id]->get_thread_stats()[tid];
-    //         for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
-    //             const auto& entry = thread_stat.per_op[op_idx];
-    //             total_cache_hits += entry.cache_stats.hits();
-    //             total_cache_misses += entry.cache_stats.misses();
-    //             std::cout << "MCS " << mcs_id << " Thread " << tid << " Op " << op_idx
-    //                       << " Cache hits=" << entry.cache_stats.hits()
-    //                       << ", misses=" << entry.cache_stats.misses()
-    //                       << ", hit_rate=" << std::fixed << std::setprecision(3) << entry.cache_stats.hit_rate()
-    //                       << std::defaultfloat << std::endl;
-    //         }
-    //     }
-    // }
+    for (size_t mcs_id = 0; mcs_id < maintenance_compute_servers.size(); ++mcs_id) {
+        for (size_t tid = 0; tid < threads_per_maintenance_cs; ++tid) {
+            const auto& thread_stat = maintenance_compute_servers[mcs_id]->get_thread_stats()[tid];
+            for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
+                const auto& entry = thread_stat.per_op[op_idx];
+                total_cache_hits += entry.cache_stats.hits();
+                total_cache_misses += entry.cache_stats.misses();
+                std::cout << "MCS " << mcs_id << " Thread " << tid << " Op " << op_idx
+                          << " Cache hits=" << entry.cache_stats.hits()
+                          << ", misses=" << entry.cache_stats.misses()
+                          << ", hit_rate=" << std::fixed << std::setprecision(3) << entry.cache_stats.hit_rate()
+                          << std::defaultfloat << std::endl;
+            }
+        }
+    }
 
     double overall_hit_rate = (total_cache_hits + total_cache_misses) == 0 ? 0.0 : 
         static_cast<double>(total_cache_hits) / static_cast<double>(total_cache_hits + total_cache_misses);
@@ -527,6 +528,65 @@ int main(int argc, char* argv[]) {
               << ", entries=" << total_cache_entries
               << ", evictions=" << total_cache_evictions 
               << ", invalid_ranges=" << total_invalid_ranges << std::endl << std::defaultfloat;
+
+    // Collect and display local lock statistics from ThreadStats (per-thread tracking)
+    uint64_t total_local_acquisitions = 0;
+    uint64_t total_local_handovers = 0;
+    
+    for (size_t cs_id = 0; cs_id < compute_servers.size(); ++cs_id) {
+        uint64_t cs_acquisitions = 0;
+        uint64_t cs_handovers = 0;
+        
+        for (size_t tid = 0; tid < threads_per_cs; ++tid) {
+            const auto& thread_stat = compute_servers[cs_id]->get_thread_stats()[tid];
+            for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
+                const auto& entry = thread_stat.per_op[op_idx];
+                cs_acquisitions += entry.local_lock_acquisitions;
+                cs_handovers += entry.local_lock_handovers;
+            }
+        }
+        
+        total_local_acquisitions += cs_acquisitions;
+        total_local_handovers += cs_handovers;
+        
+        double cs_handover_rate = cs_acquisitions > 0 ? 
+            static_cast<double>(cs_handovers) / cs_acquisitions : 0.0;
+        std::cout << "CS " << cs_id << " Local locks: acquisitions=" << cs_acquisitions
+                  << ", handovers=" << cs_handovers 
+                  << ", handover_rate=" << std::fixed << std::setprecision(3) << cs_handover_rate
+                  << std::defaultfloat << std::endl;
+    }
+    
+    for (size_t mcs_id = 0; mcs_id < maintenance_compute_servers.size(); ++mcs_id) {
+        uint64_t mcs_acquisitions = 0;
+        uint64_t mcs_handovers = 0;
+        
+        for (size_t tid = 0; tid < threads_per_maintenance_cs; ++tid) {
+            const auto& thread_stat = maintenance_compute_servers[mcs_id]->get_thread_stats()[tid];
+            for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
+                const auto& entry = thread_stat.per_op[op_idx];
+                mcs_acquisitions += entry.local_lock_acquisitions;
+                mcs_handovers += entry.local_lock_handovers;
+            }
+        }
+        
+        total_local_acquisitions += mcs_acquisitions;
+        total_local_handovers += mcs_handovers;
+        
+        double mcs_handover_rate = mcs_acquisitions > 0 ? 
+            static_cast<double>(mcs_handovers) / mcs_acquisitions : 0.0;
+        std::cout << "MCS " << mcs_id << " Local locks: acquisitions=" << mcs_acquisitions
+                  << ", handovers=" << mcs_handovers
+                  << ", handover_rate=" << std::fixed << std::setprecision(3) << mcs_handover_rate
+                  << std::defaultfloat << std::endl;
+    }
+    
+    double overall_handover_rate = total_local_acquisitions > 0 ? 
+        static_cast<double>(total_local_handovers) / total_local_acquisitions : 0.0;
+    std::cout << "Total local locks: acquisitions=" << total_local_acquisitions
+              << ", handovers=" << total_local_handovers
+              << ", handover_rate=" << std::fixed << std::setprecision(3) << overall_handover_rate
+              << std::defaultfloat << std::endl;
 
     if (!profiler_sections.empty()) {
         std::vector<std::pair<std::string, ProfileStats>> sorted_sections(profiler_sections.begin(), profiler_sections.end());
@@ -604,7 +664,9 @@ int main(int argc, char* argv[]) {
                 }
                 json_out << "      \"sample_count\": " << entry.latency_samples.sample_count() << ",\n";
                 json_out << "      \"cache_hits\": " << entry.cache_stats.hits() << ",\n";
-                json_out << "      \"cache_misses\": " << entry.cache_stats.misses() << "\n";
+                json_out << "      \"cache_misses\": " << entry.cache_stats.misses() << ",\n";
+                json_out << "      \"local_lock_acquisitions\": " << entry.local_lock_acquisitions << ",\n";
+                json_out << "      \"local_lock_handovers\": " << entry.local_lock_handovers << "\n";
                 json_out << "    }";
                 if (op_idx + 1 < static_cast<size_t>(OperationKind::Count)) json_out << ",";
                 json_out << "\n";
@@ -875,6 +937,13 @@ int main(int argc, char* argv[]) {
             if (op_idx + 1 < static_cast<size_t>(OperationKind::Count)) summary_out << ",";
             summary_out << "\n";
         }
+        summary_out << "  },\n";
+        
+        // Add local lock statistics
+        summary_out << "  \"local_locks\": {\n";
+        summary_out << "    \"total_acquisitions\": " << total_local_acquisitions << ",\n";
+        summary_out << "    \"total_handovers\": " << total_local_handovers << ",\n";
+        summary_out << "    \"handover_rate\": " << overall_handover_rate << "\n";
         summary_out << "  }\n";
         summary_out << "}\n";
     } else {

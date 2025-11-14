@@ -1,258 +1,175 @@
 #pragma once
-#include <atomic>
-#include <unordered_map>
 #include <memory>
-#include <mutex>
 #include <thread>
-#include <chrono>
+#include <atomic>
+#include <vector>
+#include <cassert>
 #include "../rdma/global_address.hpp"
 #include "../util/thread_logging.hpp"
 
 namespace local_locks {
 
+// Sherman's constants
+constexpr uint64_t kLockChipMemSize = 256 * 1024;
+constexpr uint64_t kNumOfLock = kLockChipMemSize / sizeof(uint64_t);
+constexpr uint8_t kMaxHandOverTime = 0;  // DISABLED to test if handovers cause deadlock
+
 /**
- * @brief Local lock state for a specific page/address
- * Uses ticket-based locking for fairness among threads in the same CS
+ * @brief Per-waiter handover flag (like HOCL's wait queue entry)
  */
-struct LocalLockNode {
-    std::atomic<uint64_t> ticket_lock{0};  // Ticket lock: high 32 bits = now_serving, low 32 bits = next_ticket
-    std::atomic<bool> hand_over{false};    // True if lock can be handed over to local threads
-    std::atomic<uint8_t> hand_time{0};     // Number of times lock has been handed over locally
-    std::atomic<std::thread::id> owner{std::thread::id()};  // Current lock owner thread
-    std::atomic<std::chrono::steady_clock::time_point*> acquired_time{nullptr};  // When lock was acquired
-    
-    // Maximum local handovers before releasing to RDMA
-    static constexpr uint8_t MAX_HAND_TIME = 5;
-    
-    // Timeout for local locks (prevent deadlocks)
-    static constexpr auto LOCAL_LOCK_TIMEOUT = std::chrono::milliseconds(100);
-    
-    bool try_acquire_local(std::thread::id thread_id) {
-        // Get ticket
-        uint64_t ticket = ticket_lock.fetch_add(1) & 0xFFFFFFFF;
-        uint64_t current = ticket_lock.load();
-        uint32_t now_serving = (current >> 32) & 0xFFFFFFFF;
-        
-        // Wait for our turn or timeout
-        auto start = std::chrono::steady_clock::now();
-        while (now_serving != ticket) {
-            if (std::chrono::steady_clock::now() - start > LOCAL_LOCK_TIMEOUT) {
-                // Timeout - abandon this ticket
-                return false;
-            }
-            std::this_thread::yield();
-            current = ticket_lock.load();
-            now_serving = (current >> 32) & 0xFFFFFFFF;
-        }
-        
-        // We have the lock
-        owner.store(thread_id);
-        auto* time_ptr = new std::chrono::steady_clock::time_point(std::chrono::steady_clock::now());
-        acquired_time.store(time_ptr);
-        return true;
-    }
-    
-    void release_local(std::thread::id thread_id) {
-        if (owner.load() != thread_id) {
-            LOG_ERROR("Thread " << thread_id << " trying to release lock not owned by it");
-            return;
-        }
-        
-        // Clean up acquired time
-        auto* time_ptr = acquired_time.exchange(nullptr);
-        delete time_ptr;
-        
-        owner.store(std::thread::id());
-        
-        // Increment now_serving to release next waiter
-        uint64_t current = ticket_lock.load();
-        uint64_t new_val = ((current >> 32) + 1) << 32 | (current & 0xFFFFFFFF);
-        ticket_lock.store(new_val);
-    }
-    
-    bool is_owned_by(std::thread::id thread_id) const {
-        return owner.load() == thread_id;
-    }
-    
-    bool has_timed_out() const {
-        auto* time_ptr = acquired_time.load();
-        if (time_ptr == nullptr) return false;
-        return std::chrono::steady_clock::now() - *time_ptr > LOCAL_LOCK_TIMEOUT;
-    }
+struct HandoverFlag {
+    std::atomic<bool> handed_over{false};
 };
 
 /**
- * @brief Manages local locks for threads within the same ComputeServer
+ * @brief Local lock node for intra-CS serialization WITH handovers
  * 
- * This provides a shared memory space for coordinating locks among threads
- * in the same CS, reducing RDMA operations for lock acquisition.
+ * Ticket lock for local serialization + per-waiter handover flags.
+ * - ticket_lock: Lower 32 bits = next ticket, Upper 32 bits = currently serving
+ * - handover_count: Number of consecutive handovers (reset when no waiters)
+ * - handover_flags: Per-ticket handover communication (circular buffer)
+ */
+struct LocalLockNode {
+    std::atomic<uint64_t> ticket_lock{0};     // Lower 32: next ticket, Upper 32: current serving
+    std::atomic<uint8_t> handover_count{0};   // Consecutive handovers (reset on break)
+    
+    // Per-waiter handover flags (circular buffer indexed by ticket % buffer size)
+    static constexpr size_t kHandoverFlagSlots = 256;  // Support up to 256 concurrent waiters
+    HandoverFlag handover_flags[kHandoverFlagSlots];
+};
+
+/**
+ * @brief Sherman-style local lock manager using fixed arrays and ticket locks
  */
 class LocalLockManager {
 private:
-    // Hash table of local locks indexed by GlobalAddress
-    std::unordered_map<uint64_t, std::unique_ptr<LocalLockNode>> local_locks_;
-    mutable std::mutex lock_map_mutex_;  // Protects the hash table itself (mutable for const methods)
-    
-    // Statistics
-    std::atomic<uint64_t> local_acquisitions_{0};
-    std::atomic<uint64_t> local_handovers_{0};
-    std::atomic<uint64_t> rdma_fallbacks_{0};
-    std::atomic<uint64_t> timeouts_{0};
+    // Fixed array of lock nodes (Sherman style) - indexed by lock address
+    std::unique_ptr<LocalLockNode[]> local_locks_;
+    uint64_t cs_rdma_tag_;  // Shared RDMA tag for all users of this LocalLockManager
 
-public:
-    /**
-     * @brief Check if a local lock can be handed over
-     * @param addr The global address to check
-     * @return true if handover is possible
-     */
-    bool can_handover(GlobalAddress addr) const {
-        uint64_t addr_key = addr.raw; 
-        std::lock_guard<std::mutex> guard(lock_map_mutex_);
-        auto it = local_locks_.find(addr_key);
-        if (it == local_locks_.end()) {
-            return false;
-        }
-        
-        const LocalLockNode* lock_node = it->second.get();
-        std::cout << "Checking handover for address " << std::hex << addr_key 
-                  << ": hand_over=" << lock_node->hand_over.load() 
-                  << ", hand_time=" << static_cast<int>(lock_node->hand_time.load()) << std::dec << std::endl;
-        return lock_node->hand_over.load() && 
-               lock_node->hand_time.load() < LocalLockNode::MAX_HAND_TIME &&
-               !lock_node->has_timed_out();
+    // Convert GlobalAddress to lock index (Sherman's method)
+    inline size_t get_lock_index(GlobalAddress addr) const {
+        return (addr.server_index() * kNumOfLock + (addr.offset() % kNumOfLock));
     }
 
-    /**
-     * @brief Blocking acquire of local lock for the given address
-     * @param addr The global address to lock
-     * @param thread_id The requesting thread ID  
-     * @return true if handover (RDMA lock already held), false if fresh acquisition needed
-     */
-    bool acquire(GlobalAddress addr, std::thread::id thread_id) {
-        uint64_t addr_key = addr.raw;
-        
-        // Find or create the lock node
-        LocalLockNode* lock_node = nullptr;
-        bool was_handover = false;
-        {
-            std::lock_guard<std::mutex> guard(lock_map_mutex_);
-            auto it = local_locks_.find(addr_key);
-            if (it == local_locks_.end()) {
-                // Create new lock node - this is not a handover
-                local_locks_[addr_key] = std::make_unique<LocalLockNode>();
-                lock_node = local_locks_[addr_key].get();
-                was_handover = false;
-            } else {
-                lock_node = it->second.get();
-                
-                // Check if lock has timed out
-                if (lock_node->has_timed_out()) {
-                    LOG_WARN("Local lock for address " << std::hex << addr_key << " has timed out, creating fresh lock");
-                    timeouts_.fetch_add(1);
-                    // Create fresh lock node
-                    local_locks_[addr_key] = std::make_unique<LocalLockNode>();
-                    lock_node = local_locks_[addr_key].get();
-                    was_handover = false;
-                } else {
-                    // This is a potential handover if hand_over flag is set
-                    was_handover = lock_node->hand_over.load();
+public:
+    LocalLockManager(size_t num_ms) : local_locks_(new LocalLockNode[num_ms * kNumOfLock]) {
+        // Initialize all lock nodes
+        for (size_t ms = 0; ms < num_ms; ++ms) {
+            for (size_t i = 0; i < kNumOfLock; ++i) {
+                auto &node = local_locks_[ms * kNumOfLock + i];
+                node.ticket_lock.store(0);
+                node.handover_count.store(0);
+                for (size_t j = 0; j < LocalLockNode::kHandoverFlagSlots; ++j) {
+                    node.handover_flags[j].handed_over.store(false);
                 }
             }
         }
         
-        // Blocking acquire of the local lock
-        while (!lock_node->try_acquire_local(thread_id)) {
-            std::this_thread::yield();
+        // Generate CS-level RDMA tag (shared by all threads using this LocalLockManager)
+        // Use our own pointer address as unique CS identifier
+        std::hash<void*> hasher;
+        uint64_t hash_val = hasher(static_cast<void*>(this));
+        cs_rdma_tag_ = (hash_val & 0xFFFFFFFFFFFFFFFFULL);
+        if (cs_rdma_tag_ == 0) {
+            cs_rdma_tag_ = 1;
         }
         
-        local_acquisitions_.fetch_add(1);
-        if (was_handover) {
-            local_handovers_.fetch_add(1);
+        LOG_DEBUG("LocalLockManager initialized with CS RDMA tag=" << std::hex << cs_rdma_tag_ << std::dec);
+    }
+
+    ~LocalLockManager() = default;
+    
+    // Get the shared RDMA tag for this compute server
+    uint64_t get_cs_rdma_tag() const { return cs_rdma_tag_; }
+
+    /**
+     * @brief Acquire local lock for intra-CS serialization
+     * @return true if RDMA lock was handed over (skip RDMA acquire), false otherwise
+     * 
+     * Protocol (like HOCL):
+     * 1. Get ticket and wait for local lock
+     * 2. Check our per-waiter handover flag
+     * 3. Clear our flag for next time
+     * 4. Return true if handed over (caller skips RDMA), false if need RDMA acquire
+     */
+    bool acquire(GlobalAddress addr) {
+        size_t lock_idx = get_lock_index(addr);
+        auto &node = local_locks_[lock_idx];
+
+        // Get ticket for local lock
+        uint64_t lock_val = node.ticket_lock.fetch_add(1);
+        uint32_t my_ticket = static_cast<uint32_t>(lock_val & 0xFFFFFFFFu);
+        uint32_t current_serving = static_cast<uint32_t>((lock_val >> 32) & 0xFFFFFFFFu);
+        
+        // Wait for our turn
+        while (my_ticket != current_serving) {
+            std::this_thread::yield();
+            current_serving = node.ticket_lock.load(std::memory_order_acquire) >> 32;
         }
-        return was_handover;
+
+        // We now hold the local lock
+        // Check OUR specific handover flag (set by previous holder if they handed over to us)
+        size_t my_flag_idx = my_ticket % LocalLockNode::kHandoverFlagSlots;
+        bool was_handed_over = node.handover_flags[my_flag_idx].handed_over.load(std::memory_order_acquire);
+        
+        // Clear flag for next time this slot is used
+        if (was_handed_over) {
+            node.handover_flags[my_flag_idx].handed_over.store(false, std::memory_order_relaxed);
+        }
+        
+        return was_handed_over;
     }
 
     /**
-     * @brief Release a local lock
-     * @param addr The global address to unlock
-     * @param thread_id The releasing thread ID
+     * @brief Release local lock with optional handover
+     * @return true if handover (keep RDMA lock), false if should release RDMA
+     * 
+     * Protocol (like HOCL):
+     * 1. Check if another thread is waiting on local lock
+     * 2. If yes and under handover limit: set next waiter's flag, handover
+     * 3. If no waiters or limit reached: break chain
+     * 4. Release local lock
+     * 
+     * On handover: Next waiter's flag is set BEFORE we release local lock (no race!)
+     * On break: Caller releases RDMA lock
      */
-    void release(GlobalAddress addr, std::thread::id thread_id) {
-        uint64_t addr_key = addr.raw;
-        
-        std::lock_guard<std::mutex> guard(lock_map_mutex_);
-        auto it = local_locks_.find(addr_key);
-        if (it == local_locks_.end()) {
-            LOG_ERROR("Trying to release non-existent local lock for address " << std::hex << addr_key);
-            return;
-        }
-        
-        LocalLockNode* lock_node = it->second.get();
-        
-        if (!lock_node->is_owned_by(thread_id)) {
-            LOG_ERROR("Thread " << thread_id << " trying to release lock for address " 
-                     << std::hex << addr_key << " not owned by it");
-            return;
-        }
-        
-        lock_node->release_local(thread_id);
-        
-        // Check if we can enable handover (have room for more handovers and no timeout)
-        if (lock_node->hand_time.load() < LocalLockNode::MAX_HAND_TIME && 
-            !lock_node->has_timed_out()) {
-            // Enable handover - next thread can acquire without RDMA
-            lock_node->hand_over.store(true);
-            lock_node->hand_time.fetch_add(1);
+    bool release(GlobalAddress addr) {
+        size_t lock_idx = get_lock_index(addr);
+        auto &node = local_locks_[lock_idx];
+
+        // Check if we should handover
+        uint64_t lock_val = node.ticket_lock.load(std::memory_order_acquire);
+        uint32_t current_serving = static_cast<uint32_t>((lock_val >> 32) & 0xFFFFFFFFu);
+        uint32_t next_ticket = static_cast<uint32_t>(lock_val & 0xFFFFFFFFu);
+        uint8_t handovers = node.handover_count.load(std::memory_order_acquire);
+
+        // Check if someone is waiting:
+        // - current_serving = us (the holder)
+        // - next_ticket = next to be issued
+        // - Next waiter has ticket current_serving+1
+        // - So waiter exists if next_ticket > current_serving+1
+        bool has_waiter = (next_ticket > current_serving + 1);
+        bool under_limit = (handovers < kMaxHandOverTime);
+        bool should_handover = has_waiter && under_limit;
+
+        if (should_handover) {
+            // Handover: set next waiter's flag BEFORE releasing local lock
+            uint32_t next_waiter_ticket = current_serving + 1;
+            size_t next_flag_idx = next_waiter_ticket % LocalLockNode::kHandoverFlagSlots;
+            node.handover_flags[next_flag_idx].handed_over.store(true, std::memory_order_release);
+            
+            // Increment handover counter
+            node.handover_count.fetch_add(1, std::memory_order_release);
         } else {
-            // No more handovers - remove lock from map to force RDMA for next acquisition
-            local_locks_.erase(it);
+            // Break chain: reset handover counter
+            node.handover_count.store(0, std::memory_order_release);
         }
-    }
-    
-    /**
-     * @brief Force cleanup of all local locks (called when CS shuts down)
-     */
-    void cleanup_all_locks() {
-        std::lock_guard<std::mutex> guard(lock_map_mutex_);
-        for (auto& [addr, lock_node] : local_locks_) {
-            // Clean up any allocated time pointers
-            auto* time_ptr = lock_node->acquired_time.exchange(nullptr);
-            delete time_ptr;
-        }
-        local_locks_.clear();
-    }
-    
-    /**
-     * @brief Get statistics about local lock usage
-     */
-    struct Stats {
-        uint64_t local_acquisitions;
-        uint64_t local_handovers;
-        uint64_t rdma_fallbacks;
-        uint64_t timeouts;
-        size_t active_locks;
-        
-        double handover_rate() const {
-            return local_acquisitions > 0 ? 
-                static_cast<double>(local_handovers) / local_acquisitions : 0.0;
-        }
-        
-        double rdma_fallback_rate() const {
-            uint64_t total_attempts = local_acquisitions + rdma_fallbacks;
-            return total_attempts > 0 ? 
-                static_cast<double>(rdma_fallbacks) / total_attempts : 0.0;
-        }
-    };
-    
-    Stats get_stats() const {
-        std::lock_guard<std::mutex> guard(lock_map_mutex_);
-        return Stats{
-            local_acquisitions_.load(),
-            local_handovers_.load(),
-            rdma_fallbacks_.load(),
-            timeouts_.load(),
-            local_locks_.size()
-        };
+
+        // Always release local lock (advance serving ticket)
+        node.ticket_lock.fetch_add(1ULL << 32, std::memory_order_release);
+
+        return should_handover;
     }
 };
 

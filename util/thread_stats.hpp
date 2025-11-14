@@ -210,6 +210,10 @@ struct ThreadStats {
         // Retry count histogram (0-254 retries per operation)
         stats::DiscreteHistogram retry_counts_per_op;
         
+        // Local lock statistics (per-thread, no expensive atomics)
+        uint64_t local_lock_acquisitions = 0;
+        uint64_t local_lock_handovers = 0;
+        
         void record_operation(double latency_us, bool success) {
             if (success) {
                 successes++;
@@ -250,6 +254,13 @@ struct ThreadStats {
             retry_counts_per_op.record(retry_count);
         }
         
+        void record_local_lock_acquisition(bool was_handover) {
+            local_lock_acquisitions++;
+            if (was_handover) {
+                local_lock_handovers++;
+            }
+        }
+        
         void reset() {
             successes = 0;
             failures = 0;
@@ -262,6 +273,8 @@ struct ThreadStats {
             bytes_written_per_op.reset();
             cache_stats.reset();
             retry_counts_per_op.reset();
+            local_lock_acquisitions = 0;
+            local_lock_handovers = 0;
         }
     };
 
@@ -298,6 +311,10 @@ struct ThreadStats {
     
     void record_retry_count(OperationKind kind, uint32_t retry_count) {
         per_op[static_cast<size_t>(kind)].record_retry_count(retry_count);
+    }
+    
+    void record_local_lock_acquisition(OperationKind kind, bool was_handover) {
+        per_op[static_cast<size_t>(kind)].record_local_lock_acquisition(was_handover);
     }
 
     void reset() {
@@ -415,6 +432,12 @@ public:
     void record_retry() {
         if (tracking_active_) {
             retry_count_++;
+        }
+    }
+    
+    void record_local_lock_acquisition(bool was_handover) {
+        if (tracking_active_) {
+            stats_.record_local_lock_acquisition(current_op_, was_handover);
         }
     }
     

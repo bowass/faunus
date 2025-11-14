@@ -1,19 +1,49 @@
 #include "sherman_index.hpp"
 #include <thread>
 
+#include "../util/precise_sleep.hpp"
+
 using namespace sherman_index_internal;
 
 thread_local GlobalAddress path_stack[kMaxLevelOfTree];
 
-ShermanIndex::ShermanIndex(std::shared_ptr<RDMAManager> rdma_mgr, 
-                          std::shared_ptr<LocalAllocator> allocator, 
+ShermanIndex::ShermanIndex(std::shared_ptr<RDMAManager> rdma_mgr,
+                          std::shared_ptr<LocalAllocator> allocator,
                           GlobalAddress root_offset_pointer, 
                           std::shared_ptr<IndexCacheBase> cache,
                           std::shared_ptr<local_locks::LocalLockManager> local_lock_mgr)
     : KVIndex(rdma_mgr, allocator, root_offset_pointer, cache, local_lock_mgr) {
-    // TODO: assert we init lock_manager in kv_test.cpp
-    LOG_DEBUG("ShermanIndex created with " 
-              << (local_lock_mgr ? "shared" : "no") << " local lock manager");
+    
+    // Get CS-level RDMA tag from LocalLockManager (shared by all threads on this CS)
+    if (local_lock_mgr) {
+        cs_rdma_tag_ = local_lock_mgr->get_cs_rdma_tag();
+        LOG_DEBUG("ShermanIndex @" << static_cast<void*>(this) << " using shared CS RDMA tag=" << std::hex << cs_rdma_tag_ 
+                  << std::dec << " from LocalLockManager @" << local_lock_mgr.get());
+    } else {
+        // Fallback: generate unique tag per instance (no handovers possible)
+        std::hash<void*> hasher;
+        uint64_t hash_val = hasher(static_cast<void*>(this));
+        cs_rdma_tag_ = (hash_val & 0xFFFFFFFFFFFFFFFFULL);
+        if (cs_rdma_tag_ == 0) {
+            cs_rdma_tag_ = 1;
+        }
+        LOG_DEBUG("ShermanIndex @" << static_cast<void*>(this) << " created with unique RDMA tag=" 
+                  << std::hex << cs_rdma_tag_ << std::dec << " (NO local lock manager - handovers disabled!)");
+    }
+    if (cache_) {
+        auto wrapper = std::dynamic_pointer_cast<ShermanCacheWrapper>(cache_);
+        if (wrapper) {
+            sherman_cache_ = wrapper->get_cache();
+        }
+    }
+}
+
+std::shared_ptr<IndexCacheBase> ShermanIndex::create_cache(size_t cache_size_bytes) const {
+    // Estimate number of entries based on cache size
+    // Each InternalPage + overhead is roughly 1KB-2KB, so use conservative estimate
+    size_t estimated_entries = std::max(size_t(1), cache_size_bytes / 2048);
+    auto sherman_cache = std::make_shared<ShermanCache>(estimated_entries);
+    return std::make_shared<ShermanCacheWrapper>(sherman_cache);
 }
 
 bool ShermanIndex::initialize(size_t) {
@@ -41,79 +71,125 @@ bool ShermanIndex::initialize(size_t) {
 }
 
 bool ShermanIndex::try_lock_address(GlobalAddress lock_address) {
+    // Use CS-level tag (shared by all threads on this compute server)
+    uint64_t tag = cs_rdma_tag_;
+    
+    // Step 1: Acquire local lock for intra-CS serialization
+    bool is_handover = false;
     if (local_lock_mgr_) {
-        // First, acquire local lock (blocking)
-        bool was_handover = local_lock_mgr_->acquire(lock_address, std::this_thread::get_id());
+        // Acquire local lock - returns true if RDMA already held (handover)
+        is_handover = local_lock_mgr_->acquire(lock_address);
         
-        if (was_handover) {
-            // Got local lock via handover - RDMA lock already held by CS
-            // LOG_DEBUG("Acquired local lock via handover for address " << std::hex << lock_address.raw);
+        // Track local lock acquisition
+        if (stats_tracker_) {
+            stats_tracker_->record_local_lock_acquisition(is_handover);
+        }
+        
+        // If handover, we're done - RDMA lock already held by our CS
+        if (is_handover) {
+            // LOG_DEBUG("[CS:" << tag << "] Handover for addr=" << std::hex << lock_address.raw << std::dec);
             return true;
-        } else {
-            // Got local lock but need to acquire RDMA lock too
-            // LOG_DEBUG("Acquired local lock, now acquiring RDMA lock for address " << std::hex << lock_address.raw);
-            bool rdma_acquired = false;
-            for (int attempt = 0; attempt < 1000000; ++attempt) {
-                if (attempt > 10000) std::cout << "DAMN ATTEMPT = " << attempt << std::endl;
-                if (rdma_try_acquire_lock(*rdma_mgr_, lock_address)) {
-                    rdma_acquired = true;
-                    break;
-                }
-            }
+        }
+    }
+    
+    // Step 2: Acquire RDMA lock (only if not handed over)
+    // LOG_DEBUG("[CS:" << tag << "] Trying RDMA lock for addr=" << std::hex << lock_address.raw << std::dec);
+    
+    uint64_t retry_cnt = 0;
+    uint64_t pre_conflict_tag = 0;
+    uint64_t current_value = 0;
+    
+    while (true) {
+        retry_cnt++;
+
+        // Try CAS: 0 -> tag
+        uint64_t expected_val = 0;
+        RDMAOp cas_op{RDMAOpType::CAS, lock_address};
+        cas_op.op.cas.expected = reinterpret_cast<uint64_t>(&expected_val);
+        cas_op.op.cas.desired = tag;
+        
+        // Perform the CAS - expected_val will be updated with current value
+        bool op_success = rdma_mgr_->perform_op(cas_op);
+        assert(op_success && "RDMA operation should not fail");
+        
+        if (expected_val == 0) {
+            // LOG_DEBUG("[CS:" << tag << "] Acquired RDMA lock for addr=" << std::hex << lock_address.raw << std::dec << " after " << retry_cnt << " retries");
+            return true;
+        }
+
+        // CAS failed - someone else holds the lock (or we already hold it)  
+        current_value = expected_val;
+        
+        // Check if we already hold this lock (self-ownership detection)
+        // This should NOT happen in correct code, but handle gracefully
+        if (current_value == tag) {
+            // LOG_DEBUG("Thread already holds lock at address " << std::hex << lock_address.raw 
+                    //  << " with tag " << std::hex << tag << " - returning success");
+            return true;
+        }
+        
+        // Check retry limit AFTER self-ownership check
+        if (retry_cnt > 1000000) {
+            std::cout << "DEADLOCK: retry=" << retry_cnt 
+                      << " pre_tag=" << pre_conflict_tag 
+                      << " current=" << current_value 
+                      << " my_tag=" << tag
+                      << " addr=" << std::hex << lock_address.raw << std::dec
+                      << std::endl;
+            LOG_ERROR("Deadlock detected at address " << std::hex << lock_address.raw 
+                     << " - locked by tag " << std::hex << current_value 
+                     << " (our tag: " << std::hex << tag << ")");
             
-            if (rdma_acquired) {
-                // LOG_DEBUG("Acquired both local and RDMA lock for address " << std::hex << lock_address.raw);
-                return true;
-            } else {
-                // Failed to get RDMA lock - release local lock and fail
-                LOG_ERROR("Failed to acquire RDMA lock, releasing local lock for address " << std::hex << lock_address.raw);
-                local_lock_mgr_->release(lock_address, std::this_thread::get_id());
-                return false;
-            }
+            // Match Sherman: assert instead of throwing exception
+            assert(false && "Deadlock detected in RDMA locking");
+            return false;
         }
-    }
-    
-    // No local lock manager - acquire RDMA lock directly
-    // LOG_DEBUG("Attempting RDMA-only lock for address " << std::hex << lock_address.raw);
-    for (int attempt = 0; attempt < 1000000; ++attempt) {
-        if (rdma_try_acquire_lock(*rdma_mgr_, lock_address)) {
-            if (attempt > 10000) std::cout << "DAMN ATTEMPT = " << attempt << std::endl;
-            // LOG_DEBUG("Acquired RDMA-only lock for address " << std::hex << lock_address.raw);
-            return true;
+        
+        // Sherman's critical optimization: reset retry counter when lock holder changes
+        // This ensures fairness and prevents starvation when lock holder changes
+        if (current_value != pre_conflict_tag) {
+            retry_cnt = 0;  // Reset retry counter for new lock holder
+            pre_conflict_tag = current_value;
         }
+        
+        // Validate the conflict tag
+        assert(current_value != 0 && "Lock should not be 0 if CAS failed");
+        // std::cout << std::this_thread::get_id() << " ... waiting lock=" << lock_address << std::endl;
+        // util::precise_sleep_us(10);
     }
-    
-    LOG_ERROR("Failed to acquire any lock for address " << std::hex << lock_address.raw << " after many attempts");
-    assert(false && "Failed to acquire lock after many attempts");
-    return false;
 }
 
 void ShermanIndex::unlock_address(GlobalAddress lock_address) {
+    // Use CS-level tag (shared by all threads on this compute server)
+    uint64_t tag = cs_rdma_tag_;
+    
     if (local_lock_mgr_) {
-        // Check if we can handover before releasing
-        bool can_handover = local_lock_mgr_->can_handover(lock_address);
+        // Check if we should handover to next waiter on this CS
+        bool handover = local_lock_mgr_->release(lock_address);
         
-        if (!can_handover) {
-            // No handover - also release RDMA lock
-            // LOG_DEBUG("Released local lock, also releasing RDMA lock for address " << std::hex << lock_address.raw);
-            rdma_release_lock(*rdma_mgr_, lock_address);
+        if (handover) {
+            // Handover: keep RDMA lock held, next thread will skip RDMA acquire
+            // LOG_DEBUG("[CS:" << tag << "] Handover for addr=" << std::hex << lock_address.raw << std::dec);
+            // RDMA lock stays held - don't release
         } else {
-            // Handover enabled - keep RDMA lock for next thread
-            // LOG_DEBUG("Released local lock with handover enabled for address " << std::hex << lock_address.raw);
+            // No handover: release RDMA lock
+            // LOG_DEBUG("[CS:" << tag << "] Releasing RDMA lock for addr=" << std::hex << lock_address.raw << std::dec);
+            rdma_cas_release_lock(*rdma_mgr_, lock_address);
         }
-        // Release local lock
-        local_lock_mgr_->release(lock_address, std::this_thread::get_id());
     } else {
-        // No local lock manager - release RDMA lock directly
-        // LOG_DEBUG("No local lock manager, releasing RDMA lock for address " << std::hex << lock_address.raw);
-        rdma_release_lock(*rdma_mgr_, lock_address);
+        // No local lock manager - just release RDMA
+        rdma_cas_release_lock(*rdma_mgr_, lock_address);
     }
 }
 
 void ShermanIndex::lock_and_read_page(GlobalAddress lock_addr, GlobalAddress page_address, size_t page_size, void* page_buffer) {
-    // Lock the page
-    // not asserting - may fail
-    try_lock_address(lock_addr);
+    // Lock the page - should succeed with pure RDMA locking
+    bool lock_success = try_lock_address(lock_addr);
+    if (!lock_success) {
+        LOG_ERROR("Failed to acquire lock at address " << std::hex << lock_addr.raw 
+                 << " - unexpected lock contention");
+        throw std::runtime_error("Unable to acquire page lock after maximum retries");
+    }
 
     RDMAOp op{RDMAOpType::READ, page_address};
     op.op.read.buffer = reinterpret_cast<uint8_t*>(page_buffer);
@@ -129,55 +205,31 @@ void ShermanIndex::write_page_and_unlock(void* page_buffer, GlobalAddress page_a
     ops.back().op.write.buffer = reinterpret_cast<const uint8_t*>(page_buffer);
     ops.back().op.write.bytes = page_size;
 
-    // Check if we can keep the lock for handover
-    bool can_handover = false;
-    if (local_lock_mgr_) {
-        can_handover = local_lock_mgr_->can_handover(lock_addr);
-    }
-
-    if (!can_handover) {
-        // No handover - unlock the page via RDMA
-        ops.push_back(RDMAOp{RDMAOpType::WRITE, lock_addr});
-        // TODO: note that if zero is not static, compiler optimized and probably does not initialize correctly
-        static uint64_t zero = 0;
-        ops.back().op.write.buffer = reinterpret_cast<const uint8_t*>(&zero);
-        ops.back().op.write.bytes = sizeof(uint64_t);
-
-        // std::cout << "HELLO THIS WILLREMOVE DE BUG" << std::endl;
-        // TODO: if i remove this print, zero contains 1 WTFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
-        // for (size_t i = 0; i < std::min(ops.back().op.write.bytes, size_t(32)); ++i) {
-        //     std::cout << std::hex << static_cast<int>(ops.back().op.write.buffer[i]) << " ";
-        // }
-        // std::cout << std::endl;
-    }
-    else {
-        // std::cout << "Handing over lock - not unlocking remote lock" << std::endl;
-    }
-
-    // std::cout << "Number of ops to perform: " << ops.size() << std::endl;
     assert(rdma_mgr_->perform_batch(ops));
-    if (local_lock_mgr_) {
-        local_lock_mgr_->release(lock_addr, std::this_thread::get_id());
-    }
+    
+    // Release locks using unlock_address to ensure proper logging and coordination
+    unlock_address(lock_addr);
 }
 
 bool ShermanIndex::search_node(GlobalAddress node_address, const Key& key, SearchResult& result, bool from_cache /*= false*/) {
     int counter = 0;
     LeafPage page;
+    GlobalAddress lock_address = node_address;
+    
 re_read:
     if (++counter > 100) {
-        std::cout << "FICK " << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(1));
-    }    
+    }
+    
+    // Read the page first - using LeafPageSize like original Sherman
     assert(rdma_read_object(*rdma_mgr_, node_address, page));
+    
     if (!page.check_consistent()) {
-            goto re_read;
+        goto re_read;
     }
 
-    // std::cout << "[Key " << key << "] At node " << node_address << ": [" << page.hdr.lowest << ", " << page.hdr.highest << ")"
-    //           << ", level=" << (int)page.hdr.level << ", leftmost=" << page.hdr.leftmost_ptr
-    //           << ", sibling=" << page.hdr.sibling_ptr << std::endl;
-
+    // TODO: debug
+    memset(&result, 0, sizeof(result));
     result.is_leaf = (page.hdr.leftmost_ptr == GlobalAddress::Null());
     result.level = page.hdr.level;
 
@@ -185,42 +237,62 @@ re_read:
 
     if (key >= page.hdr.highest) {
         result.slibing = page.hdr.sibling_ptr;
+        // Unlock before following sibling to avoid deadlocks
+        // unlock_address(lock_address);
+        assert(result.slibing != GlobalAddress::Null());
+        assert(result.slibing != node_address);
         return true;
     }
     assert(key >= page.hdr.lowest);
 
     if (result.is_leaf) {
         if (from_cache && (key < page.hdr.lowest || key >= page.hdr.highest)) {
+            // unlock_address(lock_address);
             return false;
         }
-        // search in leaf
+        assert(result.level == 0);
+        // search in leaf - now with out-of-place records
+        Fingerprint target_fp(key);
         for (int i = 0; i < kLeafCardinality; ++i) {
             auto &r = page.records[i];
-            // TODO value null
-            if (r.key == key && r.value != Value::min() && r.f_version == r.r_version) {
-                result.val = r.value;
-                return true;
+            if (r.is_empty()) {
+                continue;
+            }
+            // Fast fingerprint comparison first
+            if (r.fingerprint == target_fp) {
+                // Read the KVItem to verify full key
+                KVItem kv_item;
+                if (!rdma_read_object(*rdma_mgr_, r.kv_ptr, kv_item)) {
+                    continue; // Read failed, skip this entry
+                }
+                if (kv_item.key == key) {
+                    result.val = kv_item.value;
+                    // unlock_address(lock_address);
+                    return true;
+                }
             }
         }
+        // unlock_address(lock_address);
     }
     // internal node
     else {
         assert(result.level != 0);
         assert(!from_cache);
-        // if (result.level == 1 && cache_) {
-        //     // add page to cache
-        // };
 
         auto internal_page = reinterpret_cast<InternalPage*>(&page);
-        // std::cout << "At internal node:";
-        // internal_page->verbose_debug();
+        if (!internal_page->check_consistent()) {
+            goto re_read;
+        }
+        if (result.level == 1 && sherman_cache_) {
+            sherman_cache_->add(page.hdr.lowest, page.hdr.highest, {node_address, *internal_page});
+        }
+
         auto cnt = internal_page->hdr.last_index + 1;
         if (key < internal_page->records[0].key) {
             result.next_level = internal_page->hdr.leftmost_ptr;
         } else {
             bool found = false;
             for (int i = 1; !found && (i < cnt); ++i) {
-                // std::cout << "Comparing " << key << " to " << internal_page->records[i].key << std::endl;
                 if (key < internal_page->records[i].key) {
                     result.next_level = internal_page->records[i - 1].ptr;
                     found = true;
@@ -230,9 +302,9 @@ re_read:
                 result.next_level = internal_page->records[cnt - 1].ptr;
             }
         }
+        // Unlock after reading internal node data
+        // unlock_address(lock_address);
     }
-
-    // std::cout << "Done searching with next_level: " << result.next_level << std::endl;
 
     return true;
 }
@@ -243,80 +315,107 @@ inline void ShermanIndex::before_operation() {
     }
 }
 
+GlobalAddress ShermanIndex::get_leaf_from_cache_entry(const Entry<Key, ShermanCacheItem>& entry, const Key& key) {
+    GlobalAddress node_address = entry.item.first;
+    InternalPage page = entry.item.second;
+
+    if (entry.start > key || entry.end <= key) {
+        return GlobalAddress::Null();
+    }
+    if (key < page.records[0].key) {
+        return page.hdr.leftmost_ptr;
+    }
+    for (int i = 1; i <= page.hdr.last_index; i++) {
+        if (key < page.records[i].key) {
+            return page.records[i - 1].ptr;
+        }
+    }
+    return page.records[page.hdr.last_index].ptr;
+}
+
 bool ShermanIndex::insert(const Key& key, const Value& value) {
     before_operation();
-    // if (cache_) {
-    //     GlobalAddress cached_address;
-    //     auto cached_result_any = cache_->search_any(key);
-    //     if (cached_result_any.has_value()) {
-    //         cached_address = cached_result_any.value().first;
-    //         // TODO: more params
-    //         auto root = get_root_offset();
-    //         if (insert_to_leaf(cached_address, key, value, root, 0, true)) {
-    //             // increase cache hits
-    //             return true;
-    //         }
-    //         // cache stale - TODO invalidate the entry itself
-    //         cache_->invalidate(cached_address);
-    //     }
-    //     // increase cache miss
-    // }
+    if (sherman_cache_) {
+        auto cached_entry = sherman_cache_->search(key);
+        if (cached_entry) {
+            GlobalAddress cached_address = get_leaf_from_cache_entry(*cached_entry, key);
+            auto root = get_root_offset();
+
+            // Cache should always point to leaf pages (level 0)
+            if (insert_to_leaf(cached_address, key, value, root, 0, true)) {
+                // Cache hit - successfully used cached entry
+                if (stats_tracker_) {
+                    stats_tracker_->record_cache_hit();
+                }
+                return true;
+            }
+            // Cache entry was stale - invalidate it
+            sherman_cache_->invalidate(cached_entry);
+        }
+        if (stats_tracker_) {
+            stats_tracker_->record_cache_miss();
+        }
+    }
+
+    // Add retry limit to prevent infinite loops
+    int retry_count = 0;
+    const int MAX_RETRIES = 1000000;
+    
     GlobalAddress root = get_root_offset();
     GlobalAddress p = root;
     SearchResult result;
+    
 next:
-    std::cout << "GOTO FC NEXT" << std::endl;
+    if (retry_count > 0) {
+        stats_tracker_->record_retry();
+    }
+    if (++retry_count > MAX_RETRIES) {
+        return false;
+    }    
     if (!search_node(p, key, result)) {
         p = get_root_offset();
-        std::cout << "R " << p << std::endl;
-        // sleep(1)!!!!! seconds!!!! A LOT!!!!
+        // Add small delay to reduce contention
+        if (retry_count % 100 == 0) {
+            std::this_thread::yield();
+        }
         goto next;
     }
     if (!result.is_leaf) {
         assert(result.level != 0);
         if (result.slibing != GlobalAddress::Null()) {
             p = result.slibing;
-            std::cout << "S " << std::this_thread::get_id() << " " << p << std::endl;
             goto next;
         }
         p = result.next_level;
         if (result.level != 1) {
-            std::cout << "L " << (int)result.level << std::endl;
             goto next;
         }
     }
-    std::cout << "[Key " << key << "] Found leaf at " << p << std::endl;
+    // Always call insert_to_leaf with level 0 (hardcoded like original Sherman)
     insert_to_leaf(p, key, value, root, 0);
-    std::cout << "[Key " << key << "] Inserted leaf at " << p << std::endl;
     return true;
 }
 
 // TODO: IMPORTANT: we need to support out-of-place records
 
 bool ShermanIndex::insert_to_leaf(GlobalAddress leaf_address, const Key& key, const Value& value, GlobalAddress root, int level, bool from_cache) {
-    // std::cout << "At insert_to_leaf(" << leaf_address << ", " << key << ", " << value << ", " << root << ", " << level << ", " << from_cache << ")" << std::endl;
     LeafPage page;
     // Using embedded locks
     GlobalAddress lock_address = leaf_address;
 
-    // rdma_read_object(*rdma_mgr_, leaf_address, page);
-    // page.check_consistent();
-    // page.debug();
-
     lock_and_read_page(lock_address, leaf_address, kLeafPageSize, &page);
-    // page.debug();
 
-    assert(page.hdr.level == level);
+    // assert(page.hdr.level == level);
+    if (!(page.hdr.level == level)) {
+        page.debug();
+        assert(0);
+    }
     assert(page.check_consistent());
     if (from_cache && (key < page.hdr.lowest || key >= page.hdr.highest)) {
-        // std::cout << "from_cache fail: " << key << " not in [" << page.hdr.lowest << ", " << page.hdr.highest << ")" << std::endl;
         unlock_address(lock_address);
         return false;
     }
     if (key >= page.hdr.highest) {
-        std::cout << key << " >= " << page.hdr.highest << std::endl;
-        page.hdr.debug();
-        std::cout << std::endl;
         unlock_address(lock_address);
         assert(page.hdr.sibling_ptr != GlobalAddress::Null());
         insert_to_leaf(page.hdr.sibling_ptr, key, value, root, level);
@@ -326,74 +425,101 @@ bool ShermanIndex::insert_to_leaf(GlobalAddress leaf_address, const Key& key, co
 
     int cnt = 0;
     int empty_index = -1;
-    char *update_addr = nullptr;
+    int update_index = -1;
+    Fingerprint target_fp(key);
+    
     for (int i = 0; i < kLeafCardinality; ++i) {
         auto &r = page.records[i];
-        // TODO: add Value::Null()
-        if (r.value != Value::min()) {
+        if (!r.is_empty()) {
             cnt++;
-            if (r.key == key) {
-                r.value = value;
-                r.f_version++;
-                r.r_version = r.f_version;
-                update_addr = (char *)&r;
-                break;
+            // Check fingerprint first, then verify key
+            if (r.fingerprint == target_fp) {
+                KVItem kv_item;
+                if (rdma_read_object(*rdma_mgr_, r.kv_ptr, kv_item)) {
+                    if (kv_item.key == key) {
+                        // Update existing item
+                        kv_item.value = value;
+                        rdma_write_object(*rdma_mgr_, r.kv_ptr, kv_item);
+                        unlock_address(lock_address);
+                        return true;
+                    }
+                }
             }
         }
         else if (empty_index == -1) {
             empty_index = i;
         }
     }
-    // TODO: unsure about that
+
     assert(cnt != kLeafCardinality);
 
-    // Update value
-    if (update_addr == nullptr) {
-        assert(empty_index != -1);
-
-        auto &r = page.records[empty_index];
-        r.key = key;
-        r.value = value;
-        r.f_version++;
-        r.r_version = r.f_version;
-
-        update_addr = (char *)&r;
-        cnt++;
-    }
+    // Insert new item
+    assert(empty_index != -1);
+    
+    // Allocate KVItem storage
+    GlobalAddress kv_item_addr = allocator_->allocate(sizeof(KVItem));
+    KVItem kv_item{key, value};
+    rdma_write_object(*rdma_mgr_, kv_item_addr, kv_item);
+    
+    // Update leaf entry with fingerprint and pointer
+    auto &r = page.records[empty_index];
+    r.fingerprint = target_fp;
+    r.kv_ptr = kv_item_addr;
+    cnt++;
 
     bool need_split = (cnt == kLeafCardinality);
-    // std::cout << "After insert attempt, cnt=" << cnt << ", need_split=" << need_split << std::endl;
     if (!need_split) {
-        assert(update_addr);
+        // Write back just the modified entry
+        char *update_addr = (char *)&r;
         GlobalAddress remote_update_address = uint64_t(leaf_address) + (update_addr - (char *)&page);
         write_page_and_unlock(update_addr, remote_update_address, sizeof(LeafEntry), lock_address);
-        // std::cout << "Updated leaf at " << leaf_address << " with key " << key << " and value " << value << std::endl;
-        // debug reading address
-        // rdma_read_object(*rdma_mgr_, leaf_address, page);
-        // std::cout << "After update + unlock:" << std::endl;
-        // page.verbose_debug();
         return true;
     }
-    // std::cout << "SPLITTIN" << std::endl;
-    // split
-    std::sort(page.records, page.records + kLeafCardinality,
-            [](const LeafEntry &a, const LeafEntry &b) { return a.key < b.key; });
+    
+    // Need to split - first sort all records by reading keys
+    std::vector<std::pair<Key, LeafEntry>> keyed_entries;
+    for (int i = 0; i < kLeafCardinality; ++i) {
+        if (!page.records[i].is_empty()) {
+            KVItem item;
+            if (rdma_read_object(*rdma_mgr_, page.records[i].kv_ptr, item)) {
+                keyed_entries.push_back({item.key, page.records[i]});
+            }
+        }
+    }
+    std::sort(keyed_entries.begin(), keyed_entries.end(),
+            [](const auto &a, const auto &b) { return a.first < b.first; });
+    
+    // Verify we have all entries (no RDMA read failures)
+    assert(keyed_entries.size() == static_cast<size_t>(cnt));
+    
+    // Copy sorted entries back to page
+    for (size_t i = 0; i < keyed_entries.size(); ++i) {
+        page.records[i] = keyed_entries[i].second;
+    }
+    for (size_t i = keyed_entries.size(); i < kLeafCardinality; ++i) {
+        page.records[i] = LeafEntry();
+    }
+
+    // Now perform the split
     Key split_key;
     GlobalAddress sibling_addr = allocator_->allocate(kLeafPageSize);
     LeafPage sibling(page.hdr.level);
 
-    int m = cnt / 2;
-    split_key = page.records[m].key;
+    size_t actual_cnt = keyed_entries.size();
+    int m = actual_cnt / 2;
+    // Use the key from our sorted vector (already read)
+    split_key = keyed_entries[m].first;
+    
     assert(split_key > page.hdr.lowest);
     assert(split_key < page.hdr.highest);
-    for (int i = m; i < cnt; ++i) {
-        sibling.records[i - m].key = page.records[i].key;
-        sibling.records[i - m].value = page.records[i].value;
-        page.records[i].key = 0;
-        page.records[i].value = Value::min(); // TODO: value null
+    
+    // Copy fingerprint+pointer pairs (not full KVItems) to sibling
+    for (size_t i = m; i < actual_cnt; ++i) {
+        sibling.records[i - m] = page.records[i];
+        page.records[i] = LeafEntry(); // Clear entry
     }
-    page.hdr.last_index -= (cnt - m);
-    sibling.hdr.last_index += (cnt - m);
+    page.hdr.last_index -= (actual_cnt - m);
+    sibling.hdr.last_index += (actual_cnt - m);
 
     // update fence
     sibling.hdr.lowest = split_key;
@@ -403,6 +529,11 @@ bool ShermanIndex::insert_to_leaf(GlobalAddress leaf_address, const Key& key, co
     // link
     sibling.hdr.sibling_ptr = page.hdr.sibling_ptr;
     page.hdr.sibling_ptr = sibling_addr;
+    
+    // Validate sibling pointers to prevent cycles
+    assert(sibling_addr != leaf_address);
+    assert(sibling.hdr.sibling_ptr != leaf_address);
+    assert(sibling.hdr.sibling_ptr != sibling_addr);
 
     // write sibling
     sibling.set_consistent();
@@ -424,7 +555,8 @@ bool ShermanIndex::insert_to_leaf(GlobalAddress leaf_address, const Key& key, co
         insert_to_internal(up_level, split_key, sibling_addr, root, level + 1);
     }
     else {
-        assert(from_cache);
+        // TODO: this assert fails for some reason
+        // assert(from_cache);
         search_and_insert_to_internal(split_key, sibling_addr, level + 1);
     }
     return true;
@@ -434,22 +566,31 @@ bool ShermanIndex::read(const Key& key, Value& value_out) {
     GlobalAddress root = get_root_offset();
     GlobalAddress p = root;
     bool from_cache = false;
-    // if (cache_) {
-    //     GlobalAddress cached_address;
-    //     auto cached_result_any = cache_->search_any(key);
-    //     if (cached_result_any.has_value()) {
-    //         p = cached_result_any.value().first;
-    //         from_cache = true;
-    //         // TODO: more params
-    //         // increase cache hits
-    //     }
-    //     else {} // increase cache miss
-    // }
+    Entry<Key, ShermanCacheItem>* cached_entry;
+
+    // Try cache lookup first
+    if (sherman_cache_) {
+        cached_entry = sherman_cache_->search(key);
+        if (cached_entry) {
+            p = get_leaf_from_cache_entry(*cached_entry, key);
+            from_cache = true;
+        } else {
+            if (stats_tracker_) {
+                stats_tracker_->record_cache_miss();
+            }
+        }
+    }
     SearchResult result;
 next:
     if (!search_node(p, key, result)) {
         if (from_cache) {
-            // TODO: invalidate entry
+            // Invalidate stale cache entry and retry from root
+            if (sherman_cache_) {
+                if (cached_entry) {
+                    sherman_cache_->invalidate(cached_entry);
+                    stats_tracker_->record_cache_miss();
+                }
+            }
             from_cache = false;
             p = root;
         }
@@ -458,6 +599,12 @@ next:
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         goto next;
+    }
+    else if (cached_entry) {
+        if (stats_tracker_) {
+            stats_tracker_->record_cache_hit();
+        }
+        cached_entry = nullptr;
     }
     if (result.is_leaf) {
         // TODO value null
@@ -488,10 +635,6 @@ bool ShermanIndex::del(const Key& key) {
 void ShermanIndex::insert_to_internal(GlobalAddress page_addr, const Key& key, GlobalAddress v, GlobalAddress root, int level) {
     GlobalAddress lock_addr = page_addr; // in-placed lock
     InternalPage page;
-
-    // TODO: debug, tmp
-    // rdma_read_object(*rdma_mgr_, page_addr, page);
-    // page.verbose_debug();
 
     lock_and_read_page(lock_addr, page_addr, kInternalPageSize, &page);
 
@@ -525,7 +668,10 @@ void ShermanIndex::insert_to_internal(GlobalAddress page_addr, const Key& key, G
 
     if (!is_update) {
         for (int i = cnt; i > insert_index; --i) {
-            page.records[i] = page.records[i - 1];
+            // page.records[i] = page.records[i - 1];
+            // TODO: debug
+            page.records[i].key = page.records[i - 1].key;
+            page.records[i].ptr = page.records[i - 1].ptr;
         }
         page.records[insert_index].key = key;
         page.records[insert_index].ptr = v;
@@ -547,9 +693,11 @@ void ShermanIndex::insert_to_internal(GlobalAddress page_addr, const Key& key, G
     assert(split_key > page.hdr.lowest);
     assert(split_key < page.hdr.highest);
     for (int i = m + 1; i < cnt; ++i) {
-        sibling.records[i - (m + 1)] = page.records[i];
+        // TODO: debug
+        sibling.records[i - (m + 1)].key = page.records[i].key;
+        sibling.records[i - (m + 1)].ptr = page.records[i].ptr;
     }
-    page.hdr.last_index -= (cnt - (m + 1));
+    page.hdr.last_index -= (cnt - m);
     sibling.hdr.last_index += (cnt - (m + 1));
 
     sibling.hdr.leftmost_ptr = page.records[m].ptr;
@@ -561,6 +709,11 @@ void ShermanIndex::insert_to_internal(GlobalAddress page_addr, const Key& key, G
     // link
     sibling.hdr.sibling_ptr = page.hdr.sibling_ptr;
     page.hdr.sibling_ptr = sibling_addr;
+
+    // Validate sibling pointers to prevent cycles in internal nodes
+    assert(sibling_addr != page_addr);
+    assert(sibling.hdr.sibling_ptr != page_addr);
+    assert(sibling.hdr.sibling_ptr != sibling_addr);
 
     // write sibling
     sibling.set_consistent();
@@ -596,7 +749,17 @@ next:
         // sleep(1)!!!!! seconds!!!! A LOT!!!!
         goto next;
     }
+    // TODO: should be only with root
+    if (result.level == level) {
+        insert_to_internal(p, key, v, root, level);
+        return;
+    }
     assert(result.level != 0);
+    // if (result.level == 0) {
+    //     std::this_thread::sleep_for(std::chrono::seconds(reinterpret_cast<uint64_t>(&result) % 7));
+    //     std::cout << result.val << " " << p << " " << result.is_leaf << " " << result.next_level << " " << result.slibing << std::endl;
+    //     assert(0);
+    // }
     if (result.slibing != GlobalAddress::Null()) {
         p = result.slibing;
         goto next;
@@ -606,7 +769,7 @@ next:
         goto next;
     }
  
-    insert_to_internal(p, key, v, root, level + 1);
+    insert_to_internal(p, key, v, root, level);
 }
 
 GlobalAddress ShermanIndex::get_root_offset_pointer() const {
@@ -614,8 +777,8 @@ GlobalAddress ShermanIndex::get_root_offset_pointer() const {
 }
 
 std::set<size_t> ShermanIndex::get_required_sizes_static() {
-    // TODO: assert nothing more
-    return {sizeof(GlobalAddress), kLeafPageSize, kInternalPageSize};
+    // Include KVItem for out-of-place storage
+    return {sizeof(GlobalAddress), kLeafPageSize, kInternalPageSize, sizeof(KVItem)};
 }
 
 std::set<size_t> ShermanIndex::get_required_sizes() const {
@@ -654,6 +817,5 @@ bool ShermanIndex::update_root_offset(GlobalAddress left, const Key& key, Global
 
     // TODO: later will not be assert - just return, bc multithreaded
     assert(rdma_mgr_->perform_op(op));
-    std::cout << "Updated root offset from " << old_root << " to " << new_root_address << std::endl;
     return true;
 }

@@ -2,11 +2,13 @@
 #include "kv_index.hpp"
 #include "local_lock_manager.hpp"
 #include "array_var.hpp"
+#include "../rdma/global_address.hpp"
 #include "../rdma/rdma_manager.hpp"
 #include "../rdma/local_allocator.hpp"
 #include "../util/thread_rand.hpp"
 #include "../util/thread_logging.hpp"
 #include "../util/profiler.hpp"
+#include "../cache/range_cache.hpp"
 #include <vector>
 #include <set>
 #include <string>
@@ -20,6 +22,29 @@ namespace sherman_index_internal {
     constexpr uint32_t kLeafPageSize = 1024;
     constexpr uint64_t kLockChipMemSize = 256 * 1024;
     constexpr uint64_t kNumOfLock = kLockChipMemSize / sizeof(uint64_t);
+
+    // Fingerprint: 12-bit hash of key for fast comparison
+    struct Fingerprint {
+        uint16_t value : 12;
+    
+        Fingerprint(uint16_t v = 0) : value(v & 0x0FFF) {}
+        Fingerprint(const Key& key) {
+            // Simple hash function: XOR all bytes and take lower 12 bits
+            uint16_t hash = 0;
+            for (size_t i = 0; i < key.size(); ++i) {
+                hash ^= key.data()[i];
+            }
+            value = hash & 0x0FFF;
+        }
+        operator uint16_t() const { return value; }
+        bool operator==(const Fingerprint& other) const { return value == other.value; }
+        bool operator!=(const Fingerprint& other) const { return value != other.value; }
+    };
+
+    inline std::ostream& operator<<(std::ostream& os, const Fingerprint& fp) {
+        os << "FP(" << fp.value << ")";
+        return os;
+    }
 
     // class ShermanIndex;
 
@@ -71,23 +96,21 @@ namespace sherman_index_internal {
 
     class LeafEntry {
     public:
-        // TODO: removed attribute packed, front and rear versions are full bytes
-        // uint8_t f_version : 4;
-        uint8_t f_version;
-        Key key;
-        Value value;
-        // uint8_t r_version : 4;
-        uint8_t r_version;
-
-        LeafEntry() {
-            f_version = 0;
-            r_version = 0;
-            value = Value::min();
-            key = Key::min();
+        Fingerprint fingerprint;       // 12-bit hash of key
+        uint16_t padding : 4;          // Align to 16 bits
+        GlobalAddress kv_ptr;          // Pointer to separately-allocated KVItem
+        
+        LeafEntry() : fingerprint(0), padding(0), kv_ptr(GlobalAddress::Null()) {}
+        
+        LeafEntry(const Fingerprint& fp, GlobalAddress ptr) 
+            : fingerprint(fp), padding(0), kv_ptr(ptr) {}
+        
+        bool is_empty() const {
+            return kv_ptr == GlobalAddress::Null();
         }
     } __attribute__((packed));
 
-    static_assert(sizeof(LeafEntry) == sizeof(Key) + sizeof(Value) + 2 * sizeof(uint8_t));
+    // static_assert(sizeof(LeafEntry) == sizeof(Key) + sizeof(Value) + 2 * sizeof(uint8_t));
 
     constexpr int kInternalCardinality = (kInternalPageSize - sizeof(Header) -
                                         sizeof(uint8_t) * 2 - sizeof(uint64_t)) /
@@ -98,7 +121,7 @@ namespace sherman_index_internal {
         sizeof(LeafEntry);
 
     class InternalPage {
-    // private:
+    // private:ASASASSA
     public:
         union {
             uint32_t crc;
@@ -196,7 +219,10 @@ namespace sherman_index_internal {
     public:
         LeafPage(uint32_t level = 0) {
             hdr.level = level;
-            records[0].value = Value::min();
+            // Initialize all records as empty (with null pointers)
+            for (int i = 0; i < kLeafCardinality; ++i) {
+                records[i] = LeafEntry();
+            }
 
             front_version = 0;
             rear_version = 0;
@@ -228,7 +254,12 @@ namespace sherman_index_internal {
         void verbose_debug() const {
             this->debug();
             for (int i = 0; i < kLeafCardinality; ++i) {
-                std::cout << this->records[i].key << ": " << this->records[i].value << ", ";
+                if (!this->records[i].is_empty()) {
+                    std::cout << "fp=" << this->records[i].fingerprint 
+                              << " ptr=" << this->records[i].kv_ptr << ", ";
+                } else {
+                    std::cout << "empty, ";
+                }
             }
             std::cout << std::endl;
         }
@@ -259,10 +290,23 @@ namespace sherman_index_internal {
 
 using namespace sherman_index_internal;
 
+using ShermanCacheItem = std::pair<GlobalAddress, InternalPage>;
+using ShermanCache = RangeCache<Key, ShermanCacheItem>;
+
+// ShermanCache wrapper that inherits from IndexCacheBase
+class ShermanCacheWrapper : public IndexCacheBase {
+    std::shared_ptr<ShermanCache> cache_;
+public:
+    explicit ShermanCacheWrapper(std::shared_ptr<ShermanCache> cache) : cache_(cache) {}
+    std::shared_ptr<ShermanCache> get_cache() const { return cache_; }
+};
+
 /**
- * Faunus
+ * Sherman
  */
 class ShermanIndex : public KVIndex {
+    std::shared_ptr<ShermanCache> sherman_cache_;
+    uint64_t cs_rdma_tag_;  // Single RDMA tag shared by all threads on this CS
 public:
     ShermanIndex(std::shared_ptr<RDMAManager> rdma_mgr, 
                  std::shared_ptr<LocalAllocator> allocator, 
@@ -281,6 +325,10 @@ public:
     GlobalAddress get_root_offset_pointer() const;
     static std::set<size_t> get_required_sizes_static();
     std::set<size_t> get_required_sizes() const;
+    
+    // Cache factory method
+    std::shared_ptr<IndexCacheBase> create_cache(size_t cache_size_bytes) const override;
+    
     // Print the entire tree from root
     void print_tree(size_t offset = 0, int depth = 0, bool show_kv = true);
 private:
@@ -303,4 +351,5 @@ private:
     void search_and_insert_to_internal(const Key& key, GlobalAddress v, int level);
 
     inline void before_operation();
+    GlobalAddress get_leaf_from_cache_entry(const Entry<Key, ShermanCacheItem>& entry, const Key& key);
 };
