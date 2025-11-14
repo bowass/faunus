@@ -180,6 +180,7 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
         
         // found node at the desired level
         // TODO: return the node itself - we read it
+        // NOTE: this is rare enough such that we do not return the read leaf
         if (node.header.level == level) {
             return FindNodeResult::FOUND;
         }
@@ -280,7 +281,6 @@ bool FaunusIndex::try_update_kvblock(GlobalAddress kvblock_address, KVBlock& exp
         assert(rdma_mgr_->perform_op(op));
         // if succeeded - good!
         if (tmp_expected_kvb == expected_kvb) {
-            // TODO: free old KVItem?
             GlobalAddress old_kvitem_address = expected_kvb.getAddr();
             allocator_->free(sizeof(KVItem), old_kvitem_address);
             return true;
@@ -304,7 +304,6 @@ bool FaunusIndex::try_delete_kvblock(GlobalAddress kvblock_address, KVBlock& exp
     // If CAS succeeded, free the KVItem
     if (old_expected == op.op.cas.expected) {
         GlobalAddress kvitem_address = old_expected.getAddr();
-        // TODO: free KVItem - do we need smart reclamations?
         allocator_->free(sizeof(KVItem), kvitem_address);
         return true;
     }
@@ -354,6 +353,13 @@ bool FaunusIndex::read(const Key& key, Value& value_out) {
     bool success;
     Entry<Key, FaunusCacheItem>* cached_entry = nullptr;
     for (size_t attempt = 0; attempt < 1000000; attempt++) {
+        if (attempt > 0) {
+            stats_tracker_->record_retry();
+            if (cached_entry != nullptr) {
+                cached_entry = nullptr;
+                stats_tracker_->record_cache_miss();
+            }
+        }
         // find leaf address - use cached entry only on first attempt
         auto find_result = find_node(key, leaf_address, cached_entry, 0, false, attempt == 0);
         assert(find_result != FindNodeResult::UNKNOWN && find_result != FindNodeResult::NO_SUCH_LEVEL);
@@ -369,6 +375,9 @@ bool FaunusIndex::read(const Key& key, Value& value_out) {
         bool found = false;
         success = handle_local_remove_dupes(key, leaf_address, leaf, found, value_out, 0, false, true, false);
         if (!success) continue; // retry
+        if (cached_entry) {
+            stats_tracker_->record_cache_hit();
+        }
         return found;
     }
     // deadlock???
@@ -402,6 +411,7 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         // assuming KVItem is written if leaf_read is true
         if (!leaf_read) {
             if (attempt > 0) {
+                stats_tracker_->record_retry();
                 if (faunus_cache_ && cached_entry != nullptr) {
                     faunus_cache_->invalidate(cached_entry);
                 }
@@ -453,7 +463,6 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         for (size_t i = 0; i < candidate_kvs.size(); i++) {
             // key already exists - cancel insertion
             if (candidate_kvs[i].second.key == key) {
-                // TODO: update instead
                 size_t index = candidate_kvs[i].first;
                 GlobalAddress kvblock_address = leaf_address + OFFSET_OF_ARRAY_ELEM(LeafNode, kv_blocks, index);
                 success = try_update_kvblock(kvblock_address, leaf.kv_blocks[index], kvb);
@@ -558,52 +567,53 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
 }
 
 bool FaunusIndex::update(const Key& key, const Value& value) {
-    GlobalAddress leaf_address;
-    bool success;
-    bool wrote_kvitem = false;
-    GlobalAddress kvitem_address = allocator_->allocate(sizeof(KVItem));
-    KVItem kvitem{key, value};
-    KVBlock kvb{Fingerprint(key), kvitem_address, false, false};
-    LeafNode leaf;
-    Entry<Key, FaunusCacheItem>* cached_entry = nullptr;
+    return insert(key, value);
+    // GlobalAddress leaf_address;
+    // bool success;
+    // bool wrote_kvitem = false;
+    // GlobalAddress kvitem_address = allocator_->allocate(sizeof(KVItem));
+    // KVItem kvitem{key, value};
+    // KVBlock kvb{Fingerprint(key), kvitem_address, false, false};
+    // LeafNode leaf;
+    // Entry<Key, FaunusCacheItem>* cached_entry = nullptr;
 
-    for (size_t attempt = 0; attempt < 1000000; attempt++) {
-        // find leaf address
-        auto find_result = find_node(key, leaf_address, cached_entry, 0, false, attempt == 0);
-        // TODO: use cache entry id
-        assert(find_result != FindNodeResult::UNKNOWN && find_result != FindNodeResult::NO_SUCH_LEVEL);
-        if (find_result != FindNodeResult::FOUND) continue; // retry
+    // for (size_t attempt = 0; attempt < 1000000; attempt++) {
+    //     // find leaf address
+    //     auto find_result = find_node(key, leaf_address, cached_entry, 0, false, attempt == 0);
+    //     // TODO: use cache entry id
+    //     assert(find_result != FindNodeResult::UNKNOWN && find_result != FindNodeResult::NO_SUCH_LEVEL);
+    //     if (find_result != FindNodeResult::FOUND) continue; // retry
 
-        // TODO: unlike the paper, here we write the leaf while reading the node - like in insert
-        // read leaf and write KVItem if needed
-        std::vector<RDMAOp> ops;
-        // read leafkvitem_address
-        ops.push_back(RDMAOp{RDMAOpType::READ, leaf_address});
-        ops.back().op.read.buffer = reinterpret_cast<uint8_t*>(&leaf);
-        ops.back().op.read.bytes = sizeof(LeafNode);
+    //     // TODO: unlike the paper, here we write the leaf while reading the node - like in insert
+    //     // read leaf and write KVItem if needed
+    //     std::vector<RDMAOp> ops;
+    //     // read leafkvitem_address
+    //     ops.push_back(RDMAOp{RDMAOpType::READ, leaf_address});
+    //     ops.back().op.read.buffer = reinterpret_cast<uint8_t*>(&leaf);
+    //     ops.back().op.read.bytes = sizeof(LeafNode);
 
-        // write KVItem to already allocated space
-        if (!wrote_kvitem) {
-            ops.push_back(RDMAOp{RDMAOpType::WRITE, kvitem_address});
-            ops.back().op.write.buffer = reinterpret_cast<uint8_t*>(&kvitem);
-            ops.back().op.write.bytes = sizeof(KVItem);
-            wrote_kvitem = true;
-        }
+    //     // write KVItem to already allocated space
+    //     if (!wrote_kvitem) {
+    //         ops.push_back(RDMAOp{RDMAOpType::WRITE, kvitem_address});
+    //         ops.back().op.write.buffer = reinterpret_cast<uint8_t*>(&kvitem);
+    //         ops.back().op.write.bytes = sizeof(KVItem);
+    //         wrote_kvitem = true;
+    //     }
 
-        assert(rdma_mgr_->perform_batch(ops));
-        assert(leaf.header.level == 0);
+    //     assert(rdma_mgr_->perform_batch(ops));
+    //     assert(leaf.header.level == 0);
 
-        // remove duplicate entires
-        // updates first found entry with CAs in a loop
-        bool found = false;
-        Value dummy_value;
-        success = handle_local_remove_dupes(key, leaf_address, leaf, found, dummy_value, kvb, false, false, true);
-        if (!success) continue; // retry
-        return found;
-    }
-    // deadlock???
-    assert(false);
-    return false;    
+    //     // remove duplicate entires
+    //     // updates first found entry with CAs in a loop
+    //     bool found = false;
+    //     Value dummy_value;
+    //     success = handle_local_remove_dupes(key, leaf_address, leaf, found, dummy_value, kvb, false, false, true);
+    //     if (!success) continue; // retry
+    //     return found;
+    // }
+    // // deadlock???
+    // assert(false);
+    // return false;    
 }
 
 bool FaunusIndex::del(const Key& key) {
