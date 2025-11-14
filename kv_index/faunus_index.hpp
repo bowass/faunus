@@ -8,7 +8,6 @@
 #include "../util/queued_set.hpp"
 #include "../util/thread_logging.hpp"
 #include "../util/profiler.hpp"
-// #include "../kv_index/index_cache.hpp"
 #include "../cache/range_cache.hpp"
 #include <vector>
 #include <set>
@@ -21,7 +20,7 @@
     (offsetof(type, member) + sizeof(((type*)0)->member[0]) * (index))
 
 namespace faunus_index_internal {
-    constexpr int branch_factor = 32;
+    constexpr int branch_factor = 64;
     struct Fingerprint {
         uint16_t value : 12;
     
