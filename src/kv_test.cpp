@@ -34,6 +34,7 @@
 #include "../util/cpu_affinity.hpp"
 #include "../util/thread_stats.hpp"
 
+
 // Using utility classes from dedicated headers
 
 int main(int argc, char* argv[]) {
@@ -142,8 +143,7 @@ int main(int argc, char* argv[]) {
     }
     
     for (size_t mcs_id = 0; mcs_id < num_maintenance_cs; ++mcs_id) {
-        // mcs_local_lock_mgrs[mcs_id] = std::make_shared<local_locks::LocalLockManager>();
-        mcs_local_lock_mgrs[mcs_id] = nullptr; // TODO: disabling local locks for debug
+        mcs_local_lock_mgrs[mcs_id] = std::make_shared<local_locks::LocalLockManager>(num_ms);
         LOG_INFO("Created local lock manager for MCS " << mcs_id);
     }
 
@@ -192,7 +192,6 @@ int main(int argc, char* argv[]) {
     for (size_t mcs_id = 0; mcs_id < num_maintenance_cs; ++mcs_id) {
         auto rpc_allocator = std::make_shared<RPCAllocator>(mem_servers);
         auto local_allocator = std::make_shared<LocalAllocator>(sizes, initial_slabs_per_size, rpc_allocator);
-        // TODO: for some reason MCS caches makes stuff REAL slow
         auto cache = mcs_caches[mcs_id];
         if (!config.use_cache) {
             cache = nullptr;

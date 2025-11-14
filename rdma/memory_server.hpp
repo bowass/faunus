@@ -9,8 +9,6 @@
 #include <utility>
 #include <future>
 
-// TODO: this is not implemented well, the only reason im leaving it as is because we rarey call it
-
 /**
  * @brief Simulated memory server providing RDMA access to a memory region.
  */

@@ -117,7 +117,6 @@ public:
         }
     }
     // Thread-safe allocation for a given size
-    // TODO: is map thread-safe? are the allocate() and free() in SlabAllocator thread-safe?
     int64_t allocate(size_t size) {
         auto it = slabs_.find(size);
         if (it == slabs_.end()) {
