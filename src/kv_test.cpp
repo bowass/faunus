@@ -297,11 +297,14 @@ int main(int argc, char* argv[]) {
             
             util::OperationRecorder recorder(stat);
 
-            // Simplified operation functions - insert does insert-or-update
+            // Operation functions
+            // Note: insert() has insert-or-update semantics (upsert)
+            // - Inserts if key doesn't exist
+            // - Updates value if key already exists
             auto perform_put = [&](const Key& key, const Value& value) {
                 stats_tracker.begin_operation(OperationKind::Insert);
                 auto start = std::chrono::high_resolution_clock::now();
-                bool ok = kv_index->insert(key, value);  // insert-or-update semantics
+                bool ok = kv_index->insert(key, value);
                 auto end = std::chrono::high_resolution_clock::now();
                 auto latency_us = std::chrono::duration<double, std::micro>(end - start).count();
                 stats_tracker.end_operation(latency_us, ok);
@@ -367,9 +370,12 @@ int main(int argc, char* argv[]) {
                 if (desired == OperationKind::Read) {
                     // GET operation
                     success = perform_get(key);
+                } else if (desired == OperationKind::Delete) {
+                    // DELETE operation (currently not implemented, treat as failed operation)
+                    success = false;
                 } else {
-                    // PUT operation (insert, update, delete all become puts)
-                    // insert() handles both new inserts and updates of existing keys
+                    // INSERT or UPDATE operation
+                    // Both map to insert() which has insert-or-update semantics
                     Value value = util::generate_random_value(value_rng);
                     success = perform_put(key, value);
                 }

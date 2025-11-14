@@ -83,31 +83,27 @@ public:
     virtual std::shared_ptr<IndexCacheBase> create_cache(size_t cache_size_bytes) const { return nullptr; }
     /**
      * @brief Read the value for a given key.
-     * @param key Pointer to key array
-     * @param value_out Pointer to output value array
-     * @return true if found, false otherwise
+     * @param key The key to search for
+     * @param value_out Output parameter for the value if found
+     * @return true if key exists and value retrieved, false otherwise
      */
     virtual bool read(const Key& key, Value& value_out) = 0;
+    
     /**
-     * @brief Insert a key-value pair.
-     * @param key Pointer to key array
-     * @param value Pointer to value array
-     * @return true if successful, false otherwise
+     * @brief Insert or update a key-value pair (upsert semantics).
+     * If the key already exists, updates the value. Otherwise, inserts a new entry.
+     * @param key The key to insert or update
+     * @param value The value to associate with the key
+     * @return true if operation successful, false otherwise
      */
     virtual bool insert(const Key& key, const Value& value) = 0;
+    
     /**
      * @brief Delete a key-value pair.
-     * @param key Pointer to key array
-     * @return true if successful, false otherwise
+     * @param key The key to delete
+     * @return true if deleted successfully, false if key not found or operation failed
      */
     virtual bool del(const Key& key) = 0;
-    /**
-     * @brief Update the value for a given key.
-     * @param key Pointer to key array
-     * @param value Pointer to new value array
-     * @return true if successful, false otherwise
-     */
-    virtual bool update(const Key& key, const Value& value) = 0;
 
     /**
      * @brief Optional maintenance worker. Override in derived classes if needed.

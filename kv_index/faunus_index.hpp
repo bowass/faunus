@@ -224,7 +224,6 @@ public:
     
     bool insert(const Key& key, const Value& value);
     bool read(const Key& key, Value& value_out);
-    bool update(const Key& key, const Value& value);
     bool del(const Key& key);
 
     // Optional maintenance worker: processes RPCs from a per-CS queue

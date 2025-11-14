@@ -315,7 +315,6 @@ public:
                  std::shared_ptr<local_locks::LocalLockManager> local_lock_mgr = nullptr);
     bool insert(const Key& key, const Value& value);
     bool read(const Key& key, Value& value_out);
-    bool update(const Key& key, const Value& value);
     bool del(const Key& key);
 
     // Optional maintenance worker: processes RPCs from a per-CS queue

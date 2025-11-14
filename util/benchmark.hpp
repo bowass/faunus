@@ -25,10 +25,15 @@ struct WorkerSummary {
 
 /**
  * Weighted operation picker based on configuration mix.
+ * 
+ * Operation semantics:
+ * - Insert: insert-or-update (upsert) - inserts new key or updates existing
+ * - Read: read value for key
+ * - Delete: delete key-value pair (currently not fully implemented)
  */
 class OperationPicker {
 public:
-    explicit OperationPicker(const std::array<double, 4>& operation_mix) 
+    explicit OperationPicker(const std::array<double, 3>& operation_mix) 
         : operation_mix_(operation_mix) {}
 
     template <typename RNG>
@@ -41,13 +46,11 @@ public:
         if (r < cumulative) return OperationKind::Insert;
         cumulative += operation_mix_[1];
         if (r < cumulative) return OperationKind::Read;
-        cumulative += operation_mix_[2];
-        if (r < cumulative) return OperationKind::Update;
         return OperationKind::Delete;
     }
 
 private:
-    const std::array<double, 4>& operation_mix_;
+    const std::array<double, 3>& operation_mix_;
 };
 
 /**

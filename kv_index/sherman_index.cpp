@@ -425,7 +425,6 @@ bool ShermanIndex::insert_to_leaf(GlobalAddress leaf_address, const Key& key, co
 
     int cnt = 0;
     int empty_index = -1;
-    int update_index = -1;
     Fingerprint target_fp(key);
     
     for (int i = 0; i < kLeafCardinality; ++i) {
@@ -437,7 +436,7 @@ bool ShermanIndex::insert_to_leaf(GlobalAddress leaf_address, const Key& key, co
                 KVItem kv_item;
                 if (rdma_read_object(*rdma_mgr_, r.kv_ptr, kv_item)) {
                     if (kv_item.key == key) {
-                        // Update existing item
+                        // Key already exists - update value (insert-or-update semantics)
                         kv_item.value = value;
                         rdma_write_object(*rdma_mgr_, r.kv_ptr, kv_item);
                         unlock_address(lock_address);
@@ -451,9 +450,8 @@ bool ShermanIndex::insert_to_leaf(GlobalAddress leaf_address, const Key& key, co
         }
     }
 
-    assert(cnt != kLeafCardinality);
-
     // Insert new item
+    assert(cnt != kLeafCardinality);
     assert(empty_index != -1);
     
     // Allocate KVItem storage
@@ -622,10 +620,6 @@ next:
         p = (result.slibing == GlobalAddress::Null()) ? result.next_level : result.slibing;
         goto next;
     }
-}
-
-bool ShermanIndex::update(const Key& key, const Value& value) {
-    return insert(key, value);
 }
 
 bool ShermanIndex::del(const Key& key) {

@@ -566,56 +566,6 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
     return false; // deadlock???
 }
 
-bool FaunusIndex::update(const Key& key, const Value& value) {
-    return insert(key, value);
-    // GlobalAddress leaf_address;
-    // bool success;
-    // bool wrote_kvitem = false;
-    // GlobalAddress kvitem_address = allocator_->allocate(sizeof(KVItem));
-    // KVItem kvitem{key, value};
-    // KVBlock kvb{Fingerprint(key), kvitem_address, false, false};
-    // LeafNode leaf;
-    // Entry<Key, FaunusCacheItem>* cached_entry = nullptr;
-
-    // for (size_t attempt = 0; attempt < 1000000; attempt++) {
-    //     // find leaf address
-    //     auto find_result = find_node(key, leaf_address, cached_entry, 0, false, attempt == 0);
-    //     // TODO: use cache entry id
-    //     assert(find_result != FindNodeResult::UNKNOWN && find_result != FindNodeResult::NO_SUCH_LEVEL);
-    //     if (find_result != FindNodeResult::FOUND) continue; // retry
-
-    //     // TODO: unlike the paper, here we write the leaf while reading the node - like in insert
-    //     // read leaf and write KVItem if needed
-    //     std::vector<RDMAOp> ops;
-    //     // read leafkvitem_address
-    //     ops.push_back(RDMAOp{RDMAOpType::READ, leaf_address});
-    //     ops.back().op.read.buffer = reinterpret_cast<uint8_t*>(&leaf);
-    //     ops.back().op.read.bytes = sizeof(LeafNode);
-
-    //     // write KVItem to already allocated space
-    //     if (!wrote_kvitem) {
-    //         ops.push_back(RDMAOp{RDMAOpType::WRITE, kvitem_address});
-    //         ops.back().op.write.buffer = reinterpret_cast<uint8_t*>(&kvitem);
-    //         ops.back().op.write.bytes = sizeof(KVItem);
-    //         wrote_kvitem = true;
-    //     }
-
-    //     assert(rdma_mgr_->perform_batch(ops));
-    //     assert(leaf.header.level == 0);
-
-    //     // remove duplicate entires
-    //     // updates first found entry with CAs in a loop
-    //     bool found = false;
-    //     Value dummy_value;
-    //     success = handle_local_remove_dupes(key, leaf_address, leaf, found, dummy_value, kvb, false, false, true);
-    //     if (!success) continue; // retry
-    //     return found;
-    // }
-    // // deadlock???
-    // assert(false);
-    // return false;    
-}
-
 bool FaunusIndex::del(const Key& key) {
     return false;
 }

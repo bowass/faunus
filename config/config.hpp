@@ -55,7 +55,9 @@ struct IndexConfig {
     size_t total_ops = 50000;
     size_t ops_per_client = 0; // derived if absent
     size_t warmup_inserts = 1000;
-    std::array<double, 4> operation_mix = {0.5, 0.3, 0.1, 0.1}; // insert, read, update, delete
+    // Operation mix: [insert, read, delete]
+    // Note: insert has insert-or-update (upsert) semantics
+    std::array<double, 3> operation_mix = {0.5, 0.5, 0.0};
     std::string workload;
     // Index implementation to use: enum for safe/fast selection in code
     enum class IndexType { Faunus, Sherman };
@@ -90,7 +92,7 @@ inline IndexConfig load_config(const std::string& yaml_path) {
     if (node["ops_per_client"]) cfg.ops_per_client = node["ops_per_client"].as<size_t>();
     if (node["warmup_inserts"]) cfg.warmup_inserts = node["warmup_inserts"].as<size_t>();
     if (node["workload"]) cfg.workload = node["workload"].as<std::string>();
-    else if (node["ycsb_workload"]) cfg.workload = node["ycsb_workload"].as<std::string>();
+    else if (node["preset"]) cfg.workload = node["preset"].as<std::string>();
 
     if (node["index"]) {
         std::string raw = node["index"].as<std::string>();
@@ -102,24 +104,16 @@ inline IndexConfig load_config(const std::string& yaml_path) {
     }
 
     if (!cfg.workload.empty()) {
-        static const std::map<std::string, std::array<double, 4>> ycsb_presets = {
-            {"ycsb_a", {0.0, 0.5, 0.5, 0.0}},
-            {"ycsb_b", {0.0, 0.95, 0.05, 0.0}},
-            {"ycsb_c", {0.0, 1.0, 0.0, 0.0}},
-            {"ycsb_d", {0.05, 0.95, 0.0, 0.0}},
-            {"ycsb_e", {0.05, 0.95, 0.0, 0.0}},
-            {"ycsb_f", {0.0, 0.5, 0.5, 0.0}},
+        static const std::map<std::string, std::array<double, 3>> presets = {
+            {"write-only", {1.0, 0.0, 0.0}},
+            {"write-intensive", {0.5, 0.5, 0.0}},
+            {"read-intensive", {0.05, 0.95, 0.0}},
         };
 
         std::string preset = cfg.workload;
         std::transform(preset.begin(), preset.end(), preset.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (preset.size() == 1) {
-            preset = std::string("ycsb_") + preset;
-        } else if (preset.rfind("ycsb_", 0) != 0) {
-            preset = std::string("ycsb_") + preset;
-        }
-        auto it = ycsb_presets.find(preset);
-        if (it != ycsb_presets.end()) {
+        auto it = presets.find(preset);
+        if (it != presets.end()) {
             cfg.operation_mix = it->second;
         } else {
             LOG_WARN("Unknown workload preset '" << cfg.workload << "'. Falling back to explicit operation_mix.");
@@ -142,12 +136,11 @@ inline IndexConfig load_config(const std::string& yaml_path) {
         cfg.operation_mix = {
             get_ratio("insert", cfg.operation_mix[0]),
             get_ratio("read", cfg.operation_mix[1]),
-            get_ratio("update", cfg.operation_mix[2]),
-            get_ratio("delete", cfg.operation_mix[3])
+            get_ratio("delete", cfg.operation_mix[2])
         };
-        double total = cfg.operation_mix[0] + cfg.operation_mix[1] + cfg.operation_mix[2] + cfg.operation_mix[3];
+        double total = cfg.operation_mix[0] + cfg.operation_mix[1] + cfg.operation_mix[2];
         if (total <= 0.0) {
-            cfg.operation_mix = {1.0, 0.0, 0.0, 0.0};
+            cfg.operation_mix = {1.0, 0.0, 0.0};
         } else {
             for (auto& r : cfg.operation_mix) r /= total;
         }
