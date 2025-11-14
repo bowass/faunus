@@ -120,6 +120,22 @@ namespace sherman_index_internal {
         (kLeafPageSize - sizeof(Header) - sizeof(uint8_t) * 2 - sizeof(uint64_t)) /
         sizeof(LeafEntry);
 
+    // Calculate required padding for LeafPage to reach exactly kLeafPageSize
+    constexpr size_t kLeafPagePadding = kLeafPageSize 
+        - sizeof(uint64_t)  // embedding_lock
+        - sizeof(uint8_t)   // front_version
+        - sizeof(Header)
+        - sizeof(LeafEntry) * kLeafCardinality
+        - sizeof(uint8_t);  // rear_version
+
+    // Calculate required padding for InternalPage to reach exactly kInternalPageSize
+    constexpr size_t kInternalPagePadding = kInternalPageSize
+        - sizeof(uint64_t)  // embedding_lock
+        - sizeof(uint8_t)   // front_version
+        - sizeof(Header)
+        - sizeof(InternalEntry) * kInternalCardinality
+        - sizeof(uint8_t);  // rear_version
+
     class InternalPage {
     // private:ASASASSA
     public:
@@ -133,7 +149,7 @@ namespace sherman_index_internal {
         Header hdr;
         InternalEntry records[kInternalCardinality];
 
-        uint8_t padding[3];
+        uint8_t padding[kInternalPagePadding];
         uint8_t rear_version;
 
         friend class ShermanIndex;
@@ -211,7 +227,7 @@ namespace sherman_index_internal {
         Header hdr;
         LeafEntry records[kLeafCardinality];
 
-        uint8_t padding[7];
+        uint8_t padding[kLeafPagePadding];
         uint8_t rear_version;
 
         friend class ShermanIndex;
@@ -331,9 +347,6 @@ public:
     // Print the entire tree from root
     void print_tree(size_t offset = 0, int depth = 0, bool show_kv = true);
 private:
-    // TODO: generalize index cache
-    // std::shared_ptr<IndexCache> cache_;
-
     GlobalAddress get_root_offset() const;
     bool update_root_offset(GlobalAddress left, const Key& key, GlobalAddress right, int level, GlobalAddress old_root);
 

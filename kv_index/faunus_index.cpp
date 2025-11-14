@@ -535,8 +535,8 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         for (size_t i = 0; i < branch_factor; i++) {
             if (!leaf.kv_blocks[i].isFree()) num_used++;
         }
-        // TODO: change threshold to constant, and make it configurable
-        if (num_used > branch_factor * 3 / 4) {
+        // Trigger split when utilization exceeds watermark (configurable at compile-time)
+        if (num_used > static_cast<size_t>(branch_factor * FAUNUS_SPLIT_WATERMARK)) {
             success = request_smo(FaunusMaintenanceRPC::SPLIT, leaf_address);
             assert(success);
             if (cached_entry != nullptr) {

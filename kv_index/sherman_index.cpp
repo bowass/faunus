@@ -806,10 +806,10 @@ bool ShermanIndex::update_root_offset(GlobalAddress left, const Key& key, Global
 
     assert(rdma_write_object(*rdma_mgr_, new_root_address, new_root));
     RDMAOp op{RDMAOpType::CAS, root_offset_pointer_};
-    op.op.cas.expected = reinterpret_cast<uint64_t>(&old_root);
+    GlobalAddress tmp_old_root = old_root;
+    op.op.cas.expected = reinterpret_cast<uint64_t>(&tmp_old_root);
     op.op.cas.desired = uint64_t(new_root_address);
 
-    // TODO: later will not be assert - just return, bc multithreaded
     assert(rdma_mgr_->perform_op(op));
-    return true;
+    return old_root == tmp_old_root;
 }

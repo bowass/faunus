@@ -8,8 +8,34 @@
 #include "array_var.hpp"
 #include "../rdma/global_address.hpp"
 
-using Key = ArrayVar<8>;
-using Value = ArrayVar<8>;
+/**
+ * @brief Size of keys in bytes
+ * Default: 8 bytes
+ */
+#ifndef KEY_SIZE
+#define KEY_SIZE 8
+#endif
+
+/**
+ * @brief Size of values in bytes
+ * Default: 8 bytes
+ */
+#ifndef VALUE_SIZE
+#define VALUE_SIZE 8
+#endif
+
+// ============================================================================
+// Compile-time Validation
+// ============================================================================
+
+static_assert(KEY_SIZE > 0 && KEY_SIZE <= 1024,
+              "KEY_SIZE must be between 1 and 1024 bytes");
+
+static_assert(VALUE_SIZE > 0 && VALUE_SIZE <= 1024,
+              "VALUE_SIZE must be between 1 and 1024 bytes");
+
+using Key = ArrayVar<KEY_SIZE>;
+using Value = ArrayVar<VALUE_SIZE>;
 
 // Forward declarations
 class RDMAManager;

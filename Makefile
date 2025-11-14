@@ -2,6 +2,25 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -O2 -Wall -pthread -Iinclude -Irdma -g
 
+# Compile-time configuration flags (can be overridden on command line)
+# Example: make FAUNUS_BRANCH_FACTOR=128 KEY_SIZE=16
+# - FAUNUS_BRANCH_FACTOR: Branch factor for Faunus B+Tree (default: 64)
+# - KEY_SIZE: Key size in bytes (default: 8)
+# - VALUE_SIZE: Value size in bytes (default: 8)
+# - FAUNUS_SPLIT_WATERMARK: Split threshold 0.0-1.0 (default: 0.75)
+ifdef FAUNUS_BRANCH_FACTOR
+CXXFLAGS += -DFAUNUS_BRANCH_FACTOR=$(FAUNUS_BRANCH_FACTOR)
+endif
+ifdef KEY_SIZE
+CXXFLAGS += -DKEY_SIZE=$(KEY_SIZE)
+endif
+ifdef VALUE_SIZE
+CXXFLAGS += -DVALUE_SIZE=$(VALUE_SIZE)
+endif
+ifdef FAUNUS_SPLIT_WATERMARK
+CXXFLAGS += -DFAUNUS_SPLIT_WATERMARK=$(FAUNUS_SPLIT_WATERMARK)
+endif
+
 SRC_DIR = src
 RDMA_DIR = rdma
 KV_DIR = kv_index

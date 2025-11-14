@@ -15,12 +15,43 @@
 #include <cstdint>
 #include <memory>
 
+// ============================================================================
+// Faunus Index Configuration
+// ============================================================================
+
+/**
+ * @brief Branch factor for FaunusIndex B+Tree nodes
+ * Controls the number of entries per leaf/internal node.
+ * Higher values reduce tree height but increase node size.
+ * Default: 32
+ */
+#ifndef FAUNUS_BRANCH_FACTOR
+#define FAUNUS_BRANCH_FACTOR 32
+#endif
+
+/**
+ * @brief Split watermark threshold for FaunusIndex leaf nodes
+ * When the number of used slots exceeds (branch_factor * FAUNUS_SPLIT_WATERMARK),
+ * a split operation is triggered.
+ * Range: 0.0 to 1.0
+ * Default: 0.75 (75% full)
+ */
+#ifndef FAUNUS_SPLIT_WATERMARK
+#define FAUNUS_SPLIT_WATERMARK 0.75
+#endif
+
+// Compile-time validation
+static_assert(FAUNUS_BRANCH_FACTOR > 0 && FAUNUS_BRANCH_FACTOR <= 256, 
+              "FAUNUS_BRANCH_FACTOR must be between 1 and 256");
+static_assert(FAUNUS_SPLIT_WATERMARK > 0.0 && FAUNUS_SPLIT_WATERMARK <= 1.0,
+              "FAUNUS_SPLIT_WATERMARK must be between 0.0 and 1.0");
+
 // TODO: move this to a better place
 #define OFFSET_OF_ARRAY_ELEM(type, member, index) \
     (offsetof(type, member) + sizeof(((type*)0)->member[0]) * (index))
 
 namespace faunus_index_internal {
-    constexpr int branch_factor = 64;
+    constexpr int branch_factor = FAUNUS_BRANCH_FACTOR;
     struct Fingerprint {
         uint16_t value : 12;
     
