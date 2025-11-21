@@ -396,8 +396,6 @@ next:
     return true;
 }
 
-// TODO: IMPORTANT: we need to support out-of-place records
-
 bool ShermanIndex::insert_to_leaf(GlobalAddress leaf_address, const Key& key, const Value& value, GlobalAddress root, int level, bool from_cache) {
     LeafPage page;
     // Using embedded locks
@@ -579,6 +577,7 @@ bool ShermanIndex::read(const Key& key, Value& value_out) {
         }
     }
     SearchResult result;
+    result.val = Value::min();
 next:
     if (!search_node(p, key, result)) {
         if (from_cache) {
@@ -605,7 +604,6 @@ next:
         cached_entry = nullptr;
     }
     if (result.is_leaf) {
-        // TODO value null
         if (result.val != Value::min()) {
             value_out = result.val;
             return true;

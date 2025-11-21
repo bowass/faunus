@@ -171,6 +171,7 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
 
         // if locked and not from smo, or another smo has locked an ancestor
         // TODO: even if from_smo, we should not process if the node is locked
+        // if (node.header.lock && (!from_smo || node.header.level > level)) {
         if (node.header.lock && (!from_smo || node.header.level > level)) {
             if (got_from_cache) {
                 faunus_cache_->invalidate(cached_entry);
@@ -179,8 +180,7 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
         }
         
         // found node at the desired level
-        // TODO: return the node itself - we read it
-        // NOTE: this is rare enough such that we do not return the read leaf
+        // NOTE: this is rare enough such that we do not return the read node, even though we have it
         if (node.header.level == level) {
             return FindNodeResult::FOUND;
         }
@@ -257,9 +257,20 @@ std::vector<std::pair<size_t, KVItem>> FaunusIndex::get_candidate_kvs(const Leaf
     for (auto& [idx, addr] : candidates_entries) {
         candidates_pointers.push_back(addr);
     }
-    // TODO: optional - for non-read, can read only keys
-    std::vector<KVItem> candidate_kvs;
-    assert(rdma_read_batch(*rdma_mgr_, candidates_pointers, candidate_kvs));
+
+    std::vector<KVItem> candidate_kvs;    
+    std::vector<RDMAOp> ops;
+    get_read_batch(*rdma_mgr_, candidates_pointers, candidate_kvs, ops);
+    // non-read, we do not need the full KVItem
+    // NOTE: this assumes that Key is at the start of KVItem
+    if (!from_read) {
+        for (auto& op: ops) {
+            op.op.read.bytes = sizeof(Key);
+        }
+    }
+
+    assert(rdma_mgr_->perform_batch(ops));
+
     assert(candidate_kvs.size() == candidates_entries.size());
 
     std::vector<std::pair<size_t, KVItem>> candidates;
@@ -537,7 +548,11 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         }
         // Trigger split when utilization exceeds watermark (configurable at compile-time)
         if (num_used > static_cast<size_t>(branch_factor * FAUNUS_SPLIT_WATERMARK)) {
+#ifdef FAUNUS_MAINTENANCE_ENABLED
             success = request_smo(FaunusMaintenanceRPC::SPLIT, leaf_address);
+#else
+            split_leaf(leaf_address);
+#endif // FAUNUS_MAINTENANCE_ENABLED
             assert(success);
             if (cached_entry != nullptr) {
                 stats_tracker_->record_cache_hit();
@@ -902,8 +917,8 @@ bool FaunusIndex::setup_new_root(const Key& key, GlobalAddress right_child, size
     new_root.entries[0].child = get_root_offset();
     new_root.entries[1].child = right_child;
 
-    // TODO: not updating child fences, should already be correct according to key
-    // TODO: these two operations can be in the same RTT, but this is rare enough so we do not care
+    // NOTE: assuming that child fences are already correct
+    // NOTE: writing the new root and updating the root offset can be done in the same RTT, negligible
     // write new root
     bool success = rdma_write_object(*rdma_mgr_, new_root_address, new_root);
     assert(success);
@@ -916,6 +931,7 @@ bool FaunusIndex::setup_new_root(const Key& key, GlobalAddress right_child, size
 }
 
 bool FaunusIndex::request_smo(FaunusMaintenanceRPC::OpType op, GlobalAddress leaf_address) {
+#ifdef FAUNUS_MAINTENANCE_ENABLED
     // Prefer queued-sets if available (prevents duplicates)
     size_t num_queued_sets = num_maintenance_queued_sets();
     // size_t num_queues = num_maintenance_queues();
@@ -946,6 +962,7 @@ bool FaunusIndex::request_smo(FaunusMaintenanceRPC::OpType op, GlobalAddress lea
     // {
     //     queue->enqueue(std::move(rpc));
     // }
+#endif // FAUNUS_MAINTENANCE_ENABLED
     return true;
 }
 
@@ -1090,10 +1107,6 @@ void FaunusIndex::maintenance_worker(size_t cs_id, size_t thread_id) {
     std::cout << "Maintenance worker (CS " << cs_id << ", thread " << thread_id 
               << ") processed " << operations_processed << " operations" << std::endl;
     
-    // Finalize cache stats before thread exits
-    // If this FaunusIndex has a cache instance, ask the cache to merge this
-    // thread's TLS counters into its global counters.
-    // if (cache_) cache_->finalize_thread_stats(); // TODO implement
     Profiler::publish_thread_stats();
 }
 
