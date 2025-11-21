@@ -113,23 +113,14 @@ public:
         return static_cast<double>(total_bytes_) / total_samples_;
     }
     
-    std::vector<std::pair<std::string, uint64_t>> get_distribution() const {
-        std::vector<std::pair<std::string, uint64_t>> result;
+    std::vector<std::pair<uint64_t, uint64_t>> get_distribution() const {
+        std::vector<std::pair<uint64_t, uint64_t>> result;
         for (size_t i = 0; i < NUM_BUCKETS; ++i) {
             if (buckets_[i] > 0) {
-                std::string range;
-                if (i == 0) {
-                    range = "0B";
-                } else if (i < 10) {
-                    range = std::to_string(1ULL << (i-1)) + "B";
-                } else if (i < 20) {
-                    range = std::to_string((1ULL << (i-1)) / 1024) + "KB";
-                } else if (i < 30) {
-                    range = std::to_string((1ULL << (i-1)) / (1024 * 1024)) + "MB";
-                } else {
-                    range = std::to_string((1ULL << (i-1)) / (1024 * 1024 * 1024)) + "GB";
-                }
-                result.emplace_back(range, buckets_[i]);
+                uint64_t value;
+                if (i == 0) value = 0;
+                else value = (1ULL << i);
+                result.emplace_back(value, buckets_[i]);
             }
         }
         return result;

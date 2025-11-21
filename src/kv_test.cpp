@@ -782,6 +782,51 @@ int main(int argc, char* argv[]) {
             summary_out << "\n";
         }
         summary_out << "  },\n";
+        
+        // Add global latency metrics (across all operations)
+        summary_out << "  \"global_latency\": {\n";
+        util::HistogramLatencySampler global_merged_histogram;
+        uint64_t global_successes = 0;
+        uint64_t global_failures = 0;
+        uint64_t global_sample_count = 0;
+        
+        // Merge histograms from all operations
+        for (size_t op_idx = 0; op_idx < static_cast<size_t>(OperationKind::Count); ++op_idx) {
+            const auto& agg = op_totals[op_idx];
+            global_successes += agg.successes;
+            global_failures += agg.failures;
+            global_sample_count += agg.sample_count;
+            
+            // Re-merge histograms for global view
+            for (const auto& cs : compute_servers) {
+                for (const auto& thread_stats : cs->get_thread_stats()) {
+                    const auto& entry = thread_stats.per_op[op_idx];
+                    auto hist_data = entry.latency_samples.get_histogram();
+                    for (const auto& [bucket_center, count] : hist_data) {
+                        for (uint64_t i = 0; i < count; ++i) {
+                            global_merged_histogram.add_sample(bucket_center);
+                        }
+                    }
+                }
+            }
+        }
+        
+        summary_out << "    \"successes\": " << global_successes << ",\n";
+        summary_out << "    \"failures\": " << global_failures << ",\n";
+        summary_out << "    \"p50_latency_us\": ";
+        if (global_sample_count > 0) {
+            auto [p50, p95, p99] = global_merged_histogram.calculate_standard_percentiles();
+            summary_out << p50 << ",\n";
+            summary_out << "    \"p95_latency_us\": " << p95 << ",\n";
+            summary_out << "    \"p99_latency_us\": " << p99 << ",\n";
+        } else {
+            summary_out << "null,\n";
+            summary_out << "    \"p95_latency_us\": null,\n";
+            summary_out << "    \"p99_latency_us\": null,\n";
+        }
+        summary_out << "    \"sample_count\": " << global_sample_count << "\n";
+        summary_out << "  },\n";
+        
         summary_out << "  \"rdma\": {\n";
         summary_out << "    \"total_rtt_ms\": " << total_rtt_ms << ",\n";
         summary_out << "    \"op_counts\": [";
@@ -878,27 +923,27 @@ int main(int argc, char* argv[]) {
                     
                     // Aggregate byte histograms (simplified)
                     auto read_dist = entry.bytes_read_per_op.get_distribution();
-                    for (const auto& [range, count] : read_dist) {
+                    for (const auto& [value, count] : read_dist) {
                         // Approximate: use middle of range for aggregation
-                        uint64_t approx_bytes = 1; // Start with 1B
-                        if (range.find("KB") != std::string::npos) approx_bytes *= 1024;
-                        else if (range.find("MB") != std::string::npos) approx_bytes *= 1024 * 1024;
-                        else if (range.find("GB") != std::string::npos) approx_bytes *= 1024 * 1024 * 1024;
+                        // uint64_t approx_bytes = 1; // Start with 1B
+                        // if (range.find("KB") != std::string::npos) approx_bytes *= 1024;
+                        // else if (range.find("MB") != std::string::npos) approx_bytes *= 1024 * 1024;
+                        // else if (range.find("GB") != std::string::npos) approx_bytes *= 1024 * 1024 * 1024;
                         
                         for (uint64_t j = 0; j < count; ++j) {
-                            bytes_read_histogram.record(approx_bytes);
+                            bytes_read_histogram.record(value);
                         }
                     }
                     
                     auto written_dist = entry.bytes_written_per_op.get_distribution();
-                    for (const auto& [range, count] : written_dist) {
-                        uint64_t approx_bytes = 1;
-                        if (range.find("KB") != std::string::npos) approx_bytes *= 1024;
-                        else if (range.find("MB") != std::string::npos) approx_bytes *= 1024 * 1024;
-                        else if (range.find("GB") != std::string::npos) approx_bytes *= 1024 * 1024 * 1024;
+                    for (const auto& [value, count] : written_dist) {
+                        // uint64_t approx_bytes = 1;
+                        // if (range.find("KB") != std::string::npos) approx_bytes *= 1024;
+                        // else if (range.find("MB") != std::string::npos) approx_bytes *= 1024 * 1024;
+                        // else if (range.find("GB") != std::string::npos) approx_bytes *= 1024 * 1024 * 1024;
                         
                         for (uint64_t j = 0; j < count; ++j) {
-                            bytes_written_histogram.record(approx_bytes);
+                            bytes_written_histogram.record(value);
                         }
                     }
                     
@@ -908,10 +953,17 @@ int main(int argc, char* argv[]) {
                 }
             }
             
-            // Output aggregated histograms
+            // Output aggregated histograms with full distribution data
             summary_out << "      \"rtt_distribution\": {\n";
             summary_out << "        \"average\": " << rtt_histogram.get_average() << ",\n";
-            summary_out << "        \"total_samples\": " << rtt_histogram.total_samples() << "\n";
+            summary_out << "        \"total_samples\": " << rtt_histogram.total_samples() << ",\n";
+            summary_out << "        \"histogram\": [";
+            auto rtt_dist = rtt_histogram.get_distribution();
+            for (size_t i = 0; i < rtt_dist.size(); ++i) {
+                summary_out << "{\"value\": " << rtt_dist[i].first << ", \"count\": " << rtt_dist[i].second << "}";
+                if (i + 1 < rtt_dist.size()) summary_out << ", ";
+            }
+            summary_out << "]\n";
             summary_out << "      },\n";
             
             summary_out << "      \"rdma_ops_per_operation\": {\n";
@@ -919,7 +971,14 @@ int main(int argc, char* argv[]) {
             for (size_t i = 0; i < 4; ++i) {
                 summary_out << "        \"" << rdma_names[i] << "\": {\n";
                 summary_out << "          \"average\": " << rdma_op_histograms[i].get_average() << ",\n";
-                summary_out << "          \"total_samples\": " << rdma_op_histograms[i].total_samples() << "\n";
+                summary_out << "          \"total_samples\": " << rdma_op_histograms[i].total_samples() << ",\n";
+                summary_out << "          \"histogram\": [";
+                auto rdma_dist = rdma_op_histograms[i].get_distribution();
+                for (size_t j = 0; j < rdma_dist.size(); ++j) {
+                    summary_out << "{\"value\": " << rdma_dist[j].first << ", \"count\": " << rdma_dist[j].second << "}";
+                    if (j + 1 < rdma_dist.size()) summary_out << ", ";
+                }
+                summary_out << "]\n";
                 summary_out << "        }";
                 if (i < 3) summary_out << ",";
                 summary_out << "\n";
@@ -929,13 +988,34 @@ int main(int argc, char* argv[]) {
             summary_out << "      \"bytes_transferred\": {\n";
             summary_out << "        \"read_avg_bytes\": " << bytes_read_histogram.get_average_bytes() << ",\n";
             summary_out << "        \"read_total_bytes\": " << bytes_read_histogram.total_bytes() << ",\n";
+            summary_out << "        \"read_histogram\": [";
+            auto read_dist = bytes_read_histogram.get_distribution();
+            for (size_t i = 0; i < read_dist.size(); ++i) {
+                summary_out << "{\"value\": " << read_dist[i].first << ", \"count\": " << read_dist[i].second << "}";
+                if (i + 1 < read_dist.size()) summary_out << ", ";
+            }
+            summary_out << "],\n";
             summary_out << "        \"written_avg_bytes\": " << bytes_written_histogram.get_average_bytes() << ",\n";
-            summary_out << "        \"written_total_bytes\": " << bytes_written_histogram.total_bytes() << "\n";
+            summary_out << "        \"written_total_bytes\": " << bytes_written_histogram.total_bytes() << ",\n";
+            summary_out << "        \"written_histogram\": [";
+            auto written_dist = bytes_written_histogram.get_distribution();
+            for (size_t i = 0; i < written_dist.size(); ++i) {
+                summary_out << "{\"value\": " << written_dist[i].first << ", \"count\": " << written_dist[i].second << "}";
+                if (i + 1 < written_dist.size()) summary_out << ", ";
+            }
+            summary_out << "]\n";
             summary_out << "      },\n";
             
             summary_out << "      \"retry_distribution\": {\n";
             summary_out << "        \"average\": " << retry_histogram.get_average() << ",\n";
-            summary_out << "        \"total_samples\": " << retry_histogram.total_samples() << "\n";
+            summary_out << "        \"total_samples\": " << retry_histogram.total_samples() << ",\n";
+            summary_out << "        \"histogram\": [";
+            auto retry_dist = retry_histogram.get_distribution();
+            for (size_t i = 0; i < retry_dist.size(); ++i) {
+                summary_out << "{\"value\": " << retry_dist[i].first << ", \"count\": " << retry_dist[i].second << "}";
+                if (i + 1 < retry_dist.size()) summary_out << ", ";
+            }
+            summary_out << "]\n";
             summary_out << "      }\n";
             
             summary_out << "    }";
