@@ -1,171 +1,100 @@
+# Faunus: Lock-Free Distributed B+Tree for RDMA Disaggregated Memory
 
-# Faunus RDMA Simulation Framework
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+A research-oriented C++17 simulator for evaluating B+Tree indices optimized for disaggregated memory architectures with RDMA.
 
 ## Overview
-Faunus simulates a disaggregated memory system using RDMA-like operations. It models compute servers (CSs) with multiple worker threads and memory servers (MSs) with exposed memory, communicating via simulated RDMA verbs (READ, WRITE, CAS, FAA). The framework is designed for correctness, atomicity, and realistic multithreaded behavior, including verb coalescing and RTT simulation.
 
-## Features
-- **Compute Servers (CS):** Each with multiple worker threads performing RDMA operations.
-- **Memory Servers (MS):** Expose memory, minimal computation.
-- **RDMA Operations:** READ, WRITE, ATOMIC (CAS, FAA), with atomicity and thread safety.
-- **RDMA Manager:** Maps global addresses to memory servers and offsets, supports single and batch operations.
-- **Verb Coalescing:** Batch multiple RDMA operations to save RTT.
-- **Metrics:** Per-thread statistics (ops, latency, min/max latency), RTT simulation, throughput, plus JSON exports for offline analysis.
-- **Maintenance Optimization:** Queued-set data structure prevents duplicate maintenance requests, reducing unnecessary work.
-- **Extensible:** Easily add new RDMA verbs or server types.
+**Simulation Platform:** Faunus provides a high-fidelity RDMA simulation layer modeling one-sided operations (READ, WRITE, CAS, FAA) with realistic latency characteristics, enabling rapid prototyping and controlled experimental evaluation without physical hardware dependencies. The simulator enforces network round-trip times and supports batched operations to accurately reflect disaggregated memory performance.
 
-## Build Instructions
+**Faunus Design:** Faunus is an optimized B+Tree that minimizes network round-trips through aggressive operation batching, employs optimistic concurrency control via RDMA CAS primitives, and supports optional client-side caching and asynchronous background maintenance. The index is designed ground-up for remote memory access patterns, prioritizing RTT reduction over CPU efficiency.
 
-1. **Dependencies:**
-	- C++17 or newer
-	- POSIX threads (Linux)
+**Baseline:** We implement the [Sherman](https://github.com/thustorage/Sherman) B+Tree design in our simulation platform to serve as a baseline for comparison, following their RDMA-based distributed index approach
 
-2. **Build:**
-	```sh
-	make kv_test
-	```
-	This produces the executable `faunus_sim`.
+## System Requirements
 
-3. **Clean:**
-	```sh
-	make clean
-	```
+- **Compiler**: GCC 7+ or Clang 6+ with C++17 support
+- **Dependencies**: `libyaml-cpp-dev`, `make`
+- **Optional**: Python 3 with `matplotlib`, `numpy`, `pyyaml` for experiment automation
 
-## Usage
-
-Run the Faunus index workload simulation:
-```sh
-./kv_test path/to/config.yaml
+**Installation (Ubuntu/Debian):**
+```bash
+sudo apt-get update
+sudo apt-get install build-essential libyaml-cpp-dev
+pip3 install matplotlib numpy pyyaml  # Optional, for plotting
 ```
 
-The harness performs three phases:
+## Building
 
-1. **Warm-up:** A shared pool of inserts (`warmup_inserts` in the YAML config) seeds the tree so subsequent operations can target existing keys.
-2. **Mixed workload:** Each compute thread gets a fixed amount of operations to perform, and repeatedly samples an operation type according to the configured `operation_mix` ratios (insert/read/update/delete), and generates key/value pools using local key/value pool.
-3. **Reporting:** Per-thread latency stats (avg/min/max), success counters, throughput, and RDMA verb counts/RTT aggregates are printed. Matching JSON artifacts are written to `thread_stats/` (one file per worker plus a `summary.json`) so you can plot results without scraping stdout. The summary now includes the measured workload window, overall operations-per-second, and per-operation throughput alongside the latency distribution. Metrics are still accessible programmatically through `ThreadStats` and `RDMAManager::collect_stats()`.
-
-
-## Code Structure
-
-- `kv_test.cpp` — RDMA workload harness with shared operation pools and detailed metrics.
-- `main.cpp` — Minimal smoke test for the RDMA plumbing.
-- `compute_server.hpp/cpp` — Compute server logic, worker threads, per-thread stats.
-- `memory_server.hpp/cpp` — Memory server logic, exposes RDMA memory.
-- `rdma_simulation.hpp/cpp` — Implements RDMA verbs and atomicity.
-- `rdma_manager.hpp/cpp` — Maps global addresses, manages single/batch RDMA operations, simulates RTT.
-- `Makefile` — Build instructions.
-
-## Extending the Framework
-- Add new RDMA verbs by extending `RDMAOpType` and updating `rdma_simulation` and `rdma_manager`.
-- Change server counts, memory sizes, RTT, workload size, and operation mix in `faunus_config.yaml`.
-- Activate canned YCSB workloads via `workload: ycsb_a` .. `ycsb_f` in the YAML config, or derive new patterns by tweaking `operation_mix`.
-- Add new metrics to `ThreadStats` in `compute_server.hpp`.
-
-## Example Output
-```
-CS 0:
-  Thread 0: ops=1000, avg_latency(us)=12.34, min_latency(us)=10.01, max_latency(us)=15.67
-  Thread 1: ops=1000, avg_latency(us)=12.12, min_latency(us)=10.02, max_latency(us)=15.45
-...
-Testing single RDMA operations...
-Single WRITE latency(us): 11.23
-Testing batch RDMA operations...
-Batch WRITE 0 latency(us): 10.98
-Batch WRITE 1 latency(us): 11.01
-...
+```bash
+git clone --recursive https://github.com/bowass/faunus.git
+cd faunus
+make kv_test
 ```
 
-### Visualizing results
-
-After running `kv_test`, the JSON metrics under `thread_stats/` can be summarized
-and plotted with:
-
-```sh
-python3 scripts/visualize_stats.py thread_stats
+**Build Configuration:**
+Compile-time parameters can be set via environment variables:
+```bash
+make kv_test KEY_SIZE=16 VALUE_SIZE=128 FAUNUS_MAINTENANCE_ENABLED=1
 ```
 
-When `matplotlib` is available, the script writes a set of PNG charts next to the
-JSON exports and always prints a textual digest of throughput, success ratios, and
-latencies.
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `KEY_SIZE` | 8 | Key size in bytes |
+| `VALUE_SIZE` | 8 | Value size in bytes |
+| `FAUNUS_BRANCH_FACTOR` | 64 | B+Tree fanout |
+| `FAUNUS_MAINTENANCE_ENABLED` | 0 | Enable async maintenance |
+
+## Running
+
+**Basic usage:**
+```bash
+./kv_test config/simple_faunus.yaml
+```
+Results are written to `thread_stats/` as JSON files.
+
+**Experiment automation:**
+```bash
+python3 scripts/experiment_runner.py --config experiments_evaluation.yaml
+python3 scripts/experiment_runner.py --config experiments_evaluation.yaml --plot-only
+```
+
+See `config/` directory for configuration examples and `experiments_evaluation.yaml` for experiment definitions
 
 ## License
-MIT
 
-# Maintenance Compute Servers
+MIT License
 
-The YAML config now supports the following options:
+Copyright (c) 2025 Faunus Contributors
 
-```
-maintenance_cs: <number of maintenance compute servers>
-threads_per_maintenance_cs: <threads per maintenance compute server>
-```
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-If these are set to nonzero values, the system will launch maintenance compute servers, each running the `maintenance_worker` function (if implemented by the index).
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-## Maintenance Queue Optimization
+**THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.**
 
-Faunus includes a **queued-set** optimization for maintenance operations that prevents duplicate requests from being enqueued. This is particularly important for B+ tree maintenance where multiple threads might detect the same node needs splitting or merging.
+### Third-Party Licenses
 
-### Key Benefits:
-- **Duplicate Prevention:** Only one maintenance request per unique (operation, address) pair is queued
-- **Race-Free:** Thread-safe implementation using atomic operations and mutex protection
-- **Efficiency:** Reduces unnecessary maintenance work by ~90% in high-contention scenarios
-- **Compatibility:** Drop-in replacement for regular maintenance queues
+This project includes third-party code:
 
-### Usage:
-```cpp
-// Create queued-sets instead of regular queues
-FaunusIndex::set_maintenance_queued_sets(
-    FaunusIndex::create_maintenance_queued_sets(num_maintenance_cs)
-);
+- **Sherman** (`externals/sherman/`): Baseline B+Tree implementation based on [Sherman](https://github.com/thustorage/Sherman). See original repository for license details.
+- **ConcurrentQueue** (`externals/concurrentqueue/`): Lock-free queue by [moodycamel](https://github.com/cameron314/concurrentqueue). See `externals/concurrentqueue/LICENSE.md` for details.
+- **SkipList** (`externals/skiplist/`): Cache implementation. See `externals/skiplist/LICENSE` for details.
+- **yaml-cpp**: YAML parsing library (system package). Licensed under MIT.
 
-// Request SMO operations (automatically deduplicated)
-bool success = index.request_smo(FaunusMaintenanceRPC::SPLIT, leaf_address);
-```
+---
 
-### Implementation:
-The `QueuedSet<T, K, KeyExtractor>` template provides:
-- `try_enqueue()`: Only adds if key doesn't exist, returns true/false
-- `enqueue()`: Force adds (used for STOP commands)
-- `wait_dequeue()`: Removes from both queue and uniqueness set
-- Thread-safe pending key tracking with `std::unordered_set`
-
-This optimization is especially beneficial in write-heavy workloads where many threads might simultaneously detect that the same B+ tree node needs maintenance.
-
-## Workload Configuration
-
-The YAML configuration accepts additional fields that shape the shared operation pools:
-
-```yaml
-total_ops: 20000           # how many mixed operations to execute across all threads
-warmup_inserts: 1000       # shared inserts executed once before the mixed phase
-workload: ycsb_a           # optional preset (ycsb_a .. ycsb_f)
-operation_mix:
-	insert: 0.5
-	read:   0.3
-	update: 0.1
-	delete: 0.1
-```
-
-All workers pull from the same queue, so slow threads don’t cap throughput. Keys created by inserts are placed in a shared lock-free slot pool guarded only by a capacity growth mutex; reads/updates/deletes sample uniformly from active slots. This keeps the key distribution realistic while remaining efficient on a single machine.
-
-# TODO
-- Expose per-thread RDMA verb breakdowns
-- Faunus implementation
-	- Is there a bug in the current implementation?
-	- Think about a way to optimize splits, including making clients trigger less splits
-		- Maybe change watermarks?
-	- Implement `delete`?
-	- IMPLEMENT A FUCKING WORKING 
-		- It seems to help, but not implemented efficient enough
-- Sherman + Marlin implementation
-- Visualization
--	- Plot throughput/latency graphs
-	- Create a tikz plot generator
-- Test larger branch factor
-- After we optimized, check affect of many maintenance threads
-- what happens w/o sleep?
-
-
-- MemoryServer allocation is shit
-- 
+**Disclaimer**: This is research software intended for experimental evaluation. It is not recommended for production use. No warranties are provided regarding correctness, performance, or suitability for any particular purpose. Users assume all risks and responsibilities when using this software.
