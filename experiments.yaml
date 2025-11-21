@@ -1,0 +1,344 @@
+meta:
+  runs_per_experiment: 3
+
+build:
+  executable: "./kv_test"
+  build_command: "make"
+  build_target: "kv_test"
+  clean_command: ["make", "clean"]
+
+paths:
+  summary_file: "thread_stats/summary.json"
+  output_dir: "experiment_results"
+
+
+# defaults:
+#   num_cs: 8
+#   threads_per_cs: 8
+#   num_ms: 8
+#   maintenance_cs: 1
+#   threads_per_maintenance_cs: 1
+#   mem_per_ms: 8589934592  # 8GB
+#   base_rtt_ns: 300
+  
+#   warmup_inserts: 10000000  # 10 Million
+#   ops_per_client: 1000000   # 1M operations per client
+  
+#   cache:
+#     enabled: true
+#     max_size_kb: 524288  # 512MB
+#     max_mcs_size_kb: 4096
+  
+#   cpu_binding_enabled: false
+#   log_level: INFO
+
+
+defaults:
+  num_cs: 2
+  threads_per_cs: 2
+  num_ms: 1
+  maintenance_cs: 1
+  threads_per_maintenance_cs: 1
+  mem_per_ms: 1073741824
+  base_rtt_ns: 300
+  
+  warmup_inserts: 100000
+  ops_per_client: 100000
+
+  cache:
+    enabled: true
+    max_size_kb: 524288  # 512MB
+  
+  cpu_binding_enabled: false
+  log_level: INFO
+
+experiments:
+  # ============================================================================
+  # 1. Index Comparison: Sherman vs Faunus with/without cache
+  # ============================================================================
+  - name: "index_comparison"
+    description: "Compare Sherman and Faunus with and without cache"
+    enabled: true
+    
+    variables:
+      - parameter: "index"
+        values: ["sherman", "faunus"]
+      - parameter: "cache.enabled"
+        values: [false, true]
+      - parameter: "distribution.type"
+        # values: ["uniform", "skewed"]
+        values: ["skewed"]
+      - parameter: "preset"
+        # values: ["write-only", "write-intensive", "read-intensive"]
+        values: ["write-intensive"]
+    
+    outputs:
+      - name: "throughput_latency"
+        title: "Index Comparison: Throughput and Latency"
+        series_by: ["distribution.type", "preset"]
+        annotate_values: true
+        x_axis:
+          label: "Configuration"
+        y_axes:
+          - metric: "throughput.attempted_ops_per_sec"
+            axis: "left"
+            label: "Throughput (ops/s)"
+            plot_type: "bar"
+          - metric: "global_latency.p50_latency_us"
+            metric_label: "P50"
+            axis: "right"
+            label: "Latency (μs)"
+          - metric: "global_latency.p99_latency_us"
+            metric_label: "P99"
+            axis: "right"
+            label: "Latency (μs)"
+
+      - name: "rdma_rtt_cdf"
+        title: "#of RTTs CDF"
+        series_by: ["distribution.type", "preset"]
+        annotate_values: true
+        x_axis:
+          label: "Number of RTTs"
+        cdf_ranges:
+          - x_min: 0
+            x_max: 10
+        y_axes:
+          - metric: "per_operation_rdma_metrics.insert.rtt_distribution"
+            label: "Insert RTTs"
+            plot_type: "cdf"
+          - metric: "per_operation_rdma_metrics.read.rtt_distribution"
+            label: "Read RTTs"
+            plot_type: "cdf"
+
+      - name: "rdma_retry_cdf"
+        title: "#of Retries CDF"
+        series_by: ["distribution.type", "preset"]
+        annotate_values: true
+        x_axis:
+          label: "Number of Retries"
+        y_axes:
+          - metric: "per_operation_rdma_metrics.insert.retry_distribution"
+            label: "Insert Retries"
+            plot_type: "cdf"
+          - metric: "per_operation_rdma_metrics.read.retry_distribution"
+            label: "Read Retries"
+            plot_type: "cdf"
+
+      - name: "rdma_cas_cdf"
+        title: "#of RDMA_CAS operations CDF"
+        series_by: ["distribution.type", "preset"]
+        annotate_values: true
+        x_axis:
+          label: "Number of RDMA_CAS Operations"
+        cdf_ranges:
+          - x_min: 0
+            x_max: 10
+        y_axes:
+          - metric: "per_operation_rdma_metrics.insert.rdma_ops_per_operation.CAS"
+            label: "Insert RDMA_CAS Ops"
+            plot_type: "cdf"
+
+      - name: "read_bytes_cdf"
+        title: "#of Read Bytes CDF"
+        series_by: ["distribution.type", "preset"]
+        annotate_values: true
+        x_axis:
+          label: "Number of Read Bytes"
+        y_axes:
+          - metric: "per_operation_rdma_metrics.insert.bytes_transferred.read_histogram"
+            label: "Insert Read Bytes"
+            plot_type: "cdf"
+          - metric: "per_operation_rdma_metrics.read.bytes_transferred.read_histogram"
+            label: "Read Read Bytes"
+            plot_type: "cdf"
+
+      - name: "written_bytes_cdf"
+        title: "#of Written Bytes CDF"
+        series_by: ["distribution.type", "preset"]
+        annotate_values: true
+        x_axis:
+          label: "Number of Written Bytes"
+        y_axes:
+          - metric: "per_operation_rdma_metrics.insert.bytes_transferred.written_histogram"
+            label: "Insert Written Bytes"
+            plot_type: "cdf"
+
+  # ============================================================================
+  # 2. Thread Scaling: Faunus with different thread counts
+  # ============================================================================
+  - name: "thread_scaling"
+    description: "Faunus throughput/latency with varying thread counts"
+    enabled: true
+    
+    variables:
+      - parameter: "threads_per_cs"
+        values: [1, 2, 4, 8]
+      - parameter: "index"
+        values: ["faunus"]
+      - parameter: "distribution.type"
+        values: ["uniform", "skewed"]
+      - parameter: "preset"
+        values: ["write-only", "write-intensive", "read-intensive"]
+    
+    outputs:
+      - name: "throughput_latency_vs_threads"
+        title: "Thread Scaling: Throughput and Latency"
+        series_by: ["distribution.type", "preset"]
+        x_axis:
+          metric: "threads_per_cs"
+          label: "Threads per CS"
+        y_axes:
+          - metric: "throughput.attempted_ops_per_sec"
+            axis: "left"
+            label: "Throughput (ops/s)"
+            plot_type: "bar"
+          - metric: "global_latency.p50_latency_us"
+            metric_label: "P50"
+            axis: "right"
+            label: "Latency (μs)"
+          - metric: "global_latency.p99_latency_us"
+            metric_label: "P99"
+            axis: "right"
+            label: "Latency (μs)"
+
+  # ============================================================================
+  # 3. Cache Size Scaling: Throughput + Hit Rate
+  # ============================================================================
+  - name: "cache_size_scaling"
+    description: "Faunus with different cache sizes"
+    enabled: true
+    
+    variables:
+      - parameter: "cache.max_size_kb"
+        values: [1024, 4096, 16384, 65536, 131072, 262144, 524288]  # 1MB to 512MB
+      - parameter: "index"
+        values: ["faunus"]
+      - parameter: "cache.enabled"
+        values: [true]
+      - parameter: "distribution.type"
+        # values: ["uniform", "skewed"]
+        values: ["uniform"]
+      - parameter: "preset"
+        # values: ["write-only", "write-intensive", "read-intensive"]
+        values: ["write-only"]
+    
+    outputs:
+      - name: "throughput_and_hit_rate"
+        title: "Cache Scaling: Throughput and Hit Rate"
+        series_by: ["distribution.type", "preset"]
+        x_axis:
+          metric: "cache.max_size_kb"
+          label: "Cache Size (KB)"
+          log_scale: true
+        y_axes:
+          - metric: "throughput.attempted_ops_per_sec"
+            axis: "left"
+            label: "Throughput (ops/s)"
+            plot_type: "bar"
+          - metric: "cache.total_hit_rate"
+            axis: "right"
+            label: "Cache Hit Rate"
+            plot_type: "line"
+
+  # ============================================================================
+  # 4. Key/Value Size Experiments
+  # ============================================================================
+  - name: "key_value_size"
+    description: "Throughput/latency with different key and value sizes"
+    
+    variables:
+      - parameter: "KEY_SIZE"
+        values: [8, 16, 32, 64, 128, 256]
+        compile_param: true
+      - parameter: "VALUE_SIZE"
+        values: [8, 16, 32, 64, 128, 256]
+        compile_param: true
+      - parameter: "index"
+        # values: ["sherman", "faunus"]
+        values: ["faunus"]
+      - parameter: "distribution.type"
+        # values: ["uniform", "skewed"]
+        values: ["uniform"]
+      - parameter: "preset"
+        # values: ["write-only", "write-intensive", "read-intensive"]
+        values: ["write-only"]
+    
+    outputs:
+      - name: "throughput_vs_key_size"
+        type: "line"
+        title: "Throughput vs Key Size"
+        series_by: ["index", "distribution.type", "preset"]
+        x_axis:
+          label: "Key/Value Size (bytes)"
+          # Use label_format to show compile parameters
+          label_format: "K{KEY_SIZE}_V{VALUE_SIZE}"
+        y_axes:
+          - metric: "throughput.attempted_ops_per_sec"
+            label: "Throughput (ops/s)"
+            plot_type: "bar"
+
+  # ============================================================================
+  # 5. Maintenance Scaling: Different MCS counts and threads
+  # ============================================================================
+  - name: "maintenance_scaling"
+    description: "Faunus with different maintenance configurations"
+    enabled: true
+    
+    variables:
+      - parameter: "maintenance_cs"
+        values: [1, 2, 4]
+      - parameter: "threads_per_maintenance_cs"
+        values: [1, 2, 4]
+      - parameter: "index"
+        values: ["faunus"]
+      - parameter: "distribution.type"
+        # values: ["uniform", "skewed"]
+        values: ["uniform"]
+      - parameter: "preset"
+        # values: ["write-only", "write-intensive"]
+        values: ["write-only"]
+    
+    outputs:
+      - name: "throughput_vs_maintenance"
+        type: "line"
+        title: "Throughput vs Maintenance Configuration"
+        series_by: ["distribution.type", "preset"]
+        x_axis:
+          label: "Maintenance Configuration (MCS_Threads)"
+          # Use categorical mode with custom labels
+          label_format: "{maintenance_cs}_{threads_per_maintenance_cs}"
+        y_axes:
+          - metric: "throughput.attempted_ops_per_sec"
+            label: "Throughput (ops/s)"
+            plot_type: "bar"
+
+  # ============================================================================
+  # 6. MCS vs Client SMOs
+  # ============================================================================
+  - name: "maintenance_enabled_vs_disabled"
+    description: "Compare MCS-based maintenance vs client-performed SMOs"
+    
+    variables:
+      - parameter: "FAUNUS_MAINTENANCE_ENABLED"
+        values: ["true", "undefined"]
+        compile_param: true
+      - parameter: "index"
+        values: ["faunus"]
+      - parameter: "distribution.type"
+        # values: ["uniform", "skewed"]
+        values: ["uniform"]
+      - parameter: "preset"
+        # values: ["write-only", "write-intensive"]
+        values: ["write-only"]
+    
+    outputs:
+      - name: "throughput_mcs_vs_client"
+        title: "Throughput: MCS vs Client SMOs"
+        series_by: ["distribution.type", "preset"]
+        annotate_values: true
+        x_axis:
+          label: "Maintenance Mode"
+        y_axes:
+          - metric: "throughput.attempted_ops_per_sec"
+            label: "Throughput (ops/s)"
+            plot_type: "bar"

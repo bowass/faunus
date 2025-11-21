@@ -6,7 +6,6 @@ This script executes complete experiment workflows based on configuration files:
 1. Runs all experiments defined in experiments.yaml
 2. Collects results and generates CSV files
 3. Creates TikZ plots for publication
-4. Generates performance analysis reports
 
 Usage:
     python3 experiment_runner.py --config experiments.yaml
@@ -22,23 +21,23 @@ import argparse
 import subprocess
 import shutil
 import tempfile
-import time
+import itertools
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import csv
 import statistics
+
+from plotting_module import generate_plots
 
 
 @dataclass
 class ExperimentConfig:
     """Configuration for a single experiment"""
     name: str
-    index_type: str
     config_file: str
     parameter_value: Any
     parameters: Dict[str, Any] = field(default_factory=dict)
+    compile_params: Dict[str, Any] = field(default_factory=dict)  # Compile-time parameters (KEY_SIZE, etc.)
     
 
 @dataclass
@@ -51,347 +50,595 @@ class ExperimentResult:
 
 
 class ExperimentRunner:
-    def __init__(self, experiments_config: str, output_dir: str = "experiment_results", 
-                 num_runs_per_experiment: int = 3, parallel_experiments: int = 1):
+    def __init__(self, experiments_config: str):
         self.experiments_config = experiments_config
-        self.output_dir = Path(output_dir)
-        self.num_runs = num_runs_per_experiment
-        self.parallel_experiments = parallel_experiments
-        
+
+        # Load experiment configuration
+        with open(self.experiments_config, 'r') as f:
+            self.config = yaml.safe_load(f)
+
+        self.output_dir = Path(self.config['paths']['output_dir'])
+        self.num_runs = self.config['meta']['runs_per_experiment']
+
         # Create output directories
         self.output_dir.mkdir(exist_ok=True)
         (self.output_dir / "csv").mkdir(exist_ok=True)
         (self.output_dir / "plots").mkdir(exist_ok=True)
-        (self.output_dir / "reports").mkdir(exist_ok=True)
         (self.output_dir / "raw_data").mkdir(exist_ok=True)
-        
-        # Load experiment configuration
-        with open(experiments_config, 'r') as f:
-            self.config = yaml.safe_load(f)
-        
-        # Verify kv_test binary exists
-        if not Path("./kv_test").exists():
-            raise FileNotFoundError("kv_test binary not found. Please run 'make kv_test' first.")
+
+        build_config = self.config['build']
+        self.executable = build_config['executable']
+        self.build_command = build_config['build_command']
+        self.build_target = build_config['build_target']
+        self.clean_command = build_config['clean_command']
+        if isinstance(self.clean_command, str):
+            self.clean_command = self.clean_command.split()
+
+        self.summary_file_path = self.config['paths']['summary_file']
+
+        # Verify executable exists
+        if not Path(self.executable).exists():
+            print(f"Executable '{self.executable}' not found - building.")
+            self.clean_build([])
     
-    def modify_config_file(self, base_config: str, parameters: Dict[str, Any]) -> str:
+    def modify_config_file(self, parameters: Dict[str, Any]) -> str:
         """Create a modified config file with experiment parameters"""
-        # Load base config
-        with open(base_config, 'r') as f:
-            config_data = yaml.safe_load(f)
+        # If no base_config specified, start with empty dict (will be populated with defaults)
+        config_data = {}
         
-        # Apply parameter modifications
+        print(f"  Applying {len(parameters)} parameter overrides")
+        
+        # Apply defaults from experiment config (always apply, parameters will override)
+        defaults = self.config.get('defaults', {})
+        defaults_applied = 0
+        for key, value in defaults.items():
+            if '.' in key:
+                    # Handle nested keys like "cache.enabled"
+                    keys = key.split('.')
+                    current = config_data
+                    for i, k in enumerate(keys[:-1]):
+                        if k not in current:
+                            current[k] = {}
+                        elif not isinstance(current[k], dict):
+                            print(f"  Warning: Cannot apply default for {key}: '{k}' is not a dict")
+                            break
+                        current = current[k]
+                    else:
+                        # Set default value
+                        current[keys[-1]] = value
+                        defaults_applied += 1
+            else:
+                # Simple key - always set default
+                config_data[key] = value
+                defaults_applied += 1
+        
+        if defaults_applied > 0:
+            print(f"  Applied {defaults_applied} default values")
+        
+        # Apply parameter modifications with validation
+        modifications_applied = []
         for key_path, value in parameters.items():
             # Handle nested keys like "distribution.type"
             keys = key_path.split('.')
             current = config_data
-            for key in keys[:-1]:
+            
+            # Navigate/create nested structure
+            for i, key in enumerate(keys[:-1]):
                 if key not in current:
                     current[key] = {}
+                elif not isinstance(current[key], dict):
+                    raise ValueError(
+                        f"Cannot set {key_path}: '{key}' at level {i} is {type(current[key])}, not a dict"
+                    )
                 current = current[key]
-            current[keys[-1]] = value
+            
+            # Set the final value
+            final_key = keys[-1]
+            old_value = current.get(final_key, '<not set>')
+            
+            # If setting a dict value, merge it with existing dict instead of replacing
+            if isinstance(value, dict) and isinstance(old_value, dict):
+                # Deep merge: update existing dict with new values
+                merged = old_value.copy()
+                merged.update(value)
+                current[final_key] = merged
+                modifications_applied.append((key_path, old_value, merged))
+            else:
+                # Simple value replacement
+                current[final_key] = value
+                modifications_applied.append((key_path, old_value, value))
+        
+        # TODO: remove these asserts later
+        # Validate critical fields exist
+        required_fields = ['num_cs', 'threads_per_cs', 'num_ms', 'warmup_inserts', 'ops_per_client']
+        missing_fields = [field for field in required_fields if field not in config_data]
+        assert not missing_fields, f"Config missing required fields: {missing_fields}"
+        
+        # Validate index field
+        if 'index' in config_data:
+            assert config_data['index'] in ['sherman', 'faunus'], \
+                f"Invalid index: {config_data['index']}, must be 'sherman' or 'faunus'"
+        
+        # Validate nested structures
+        if 'distribution' in config_data:
+            assert isinstance(config_data['distribution'], dict), \
+                f"'distribution' must be dict, got {type(config_data['distribution'])}"
+            # Only validate type if it's present
+            if 'type' in config_data['distribution']:
+                assert config_data['distribution']['type'] in ['uniform', 'skewed'], \
+                    f"Invalid distribution type: {config_data['distribution']['type']}"
+        
+        if 'cache' in config_data:
+            assert isinstance(config_data['cache'], dict), \
+                f"'cache' must be dict, got {type(config_data['cache'])}"
+            assert 'enabled' in config_data['cache'], "'cache' must have 'enabled'"
+            assert isinstance(config_data['cache']['enabled'], bool), \
+                f"cache.enabled must be bool, got {type(config_data['cache']['enabled'])}"
+        
+        if 'operation_mix' in config_data:
+            assert isinstance(config_data['operation_mix'], dict), \
+                f"'operation_mix' must be dict, got {type(config_data['operation_mix'])}"
+            # Check that values sum to ~1.0
+            total = sum(config_data['operation_mix'].values())
+            assert 0.99 <= total <= 1.01, \
+                f"operation_mix values must sum to 1.0, got {total}"
         
         # Create temporary config file
         temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False)
         yaml.dump(config_data, temp_file, default_flow_style=False)
         temp_file.close()
         
+        # Verify file was created
+        assert os.path.exists(temp_file.name), f"Failed to create temp config: {temp_file.name}"
+        assert os.path.getsize(temp_file.name) > 0, f"Temp config is empty: {temp_file.name}"
+        
+        print(f"  Generated config: {temp_file.name}")
+        
         return temp_file.name
+
+    def clean_build(self, build_flags: List[str]) -> bool:
+        """Compile the executable with given compile parameters"""
+        # Clean
+        print(f"    Running: {' '.join(self.clean_command)}")
+        result = subprocess.run(self.clean_command, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            print(f"    Clean command failed: {result.stderr}")
+            return False
+
+        build_cmd = [self.build_command, self.build_target, '-j', '6'] + build_flags
+        print(f"    Running: {' '.join(build_cmd)}")
+        result = subprocess.run(build_cmd, capture_output=True, text=True, timeout=300)
+
+        if result.returncode != 0:
+            print(f"    Build failed: {result.stderr[:500]}")
+            return False
+    
+        print("    Recompilation successful")
+        return True
+
+    def recompile_if_needed(self, compile_params: Dict[str, Any]) -> bool:
+        """
+        Recompile executable if compile parameters are specified.
+        Returns True if recompilation was successful, False otherwise.
+        """
+        if not compile_params:
+            return True  # No recompilation needed
+        
+        print(f"  Recompiling with parameters: {compile_params}")
+        
+        # Build command with compile flags
+        build_flags = []
+        for param_name, param_value in compile_params.items():
+            if param_value == "undefined":
+                # Skip this parameter (don't define it)
+                print(f"    Skipping {param_name} (undefined)")
+                continue
+            build_flags.append(f"{param_name}={param_value}")
+        
+        # Clean and rebuild
+        try:
+            return self.clean_build(build_flags)
+            
+        except subprocess.TimeoutExpired:
+            print("    Recompilation timed out")
+            return False
+        except Exception as e:
+            print(f"    Recompilation error: {e}")
+            return False
     
     def run_single_experiment(self, experiment: ExperimentConfig) -> ExperimentResult:
         """Run a single experiment with the given configuration"""
         print(f"Running experiment: {experiment.name}")
         
         try:
+            # Recompile if needed
+            if experiment.compile_params:
+                if not self.recompile_if_needed(experiment.compile_params):
+                    return ExperimentResult(
+                        config=experiment,
+                        metrics={},
+                        success=False,
+                        error_message="Recompilation failed"
+                    )
+            
             # Create modified config file
-            temp_config = self.modify_config_file(experiment.config_file, experiment.parameters)
+            temp_config = self.modify_config_file(experiment.parameters)
             
-            # Run the performance analysis script
-            cmd = [
-                sys.executable, "scripts/run_performance_analysis.py",
-                temp_config, str(self.num_runs)
-            ]
+            # Save config for reference
+            config_save_path = self.output_dir / "raw_data" / f"{experiment.name}_config.yaml"
+            config_save_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(temp_config, config_save_path)
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            # Run multiple times and average results (if num_runs > 1)
+            all_metrics = []
             
+            for run_idx in range(self.num_runs):
+                if self.num_runs > 1:
+                    print(f"  Run {run_idx + 1}/{self.num_runs}...")
+                
+                # Run executable directly
+                cmd = [self.executable, temp_config]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                
+                if result.returncode != 0:
+                    stderr_msg = result.stderr.strip()
+                    stdout_msg = result.stdout.strip()
+                    print(f"    Warning: Run {run_idx + 1} failed (exit code {result.returncode})")
+                    if stderr_msg:
+                        print(f"    STDERR: {stderr_msg[:300]}")
+                    if stdout_msg:
+                        print(f"    STDOUT (last 200 chars): ...{stdout_msg[-200:]}")
+                    continue
+                
+                # Parse the latest summary file
+                summary_file = Path(self.summary_file_path)
+                if not summary_file.exists():
+                    print(f"    Warning: Run {run_idx + 1} - Summary file not found")
+                    continue
+                
+                with open(summary_file, 'r') as f:
+                    summary_data = json.load(f)
+                
+                # Extract metrics
+                all_metrics.append(summary_data)
+                
+                # Save raw data for this run
+                if self.num_runs > 1:
+                    raw_data_file = self.output_dir / "raw_data" / f"{experiment.name}_run{run_idx + 1}.json"
+                else:
+                    raw_data_file = self.output_dir / "raw_data" / f"{experiment.name}.json"
+                
+                with open(raw_data_file, 'w') as f:
+                    json.dump(summary_data, f, indent=2)
+
             # Clean up temp config
             os.unlink(temp_config)
-            
-            if result.returncode != 0:
+
+            if not all_metrics:
                 return ExperimentResult(
                     config=experiment,
                     metrics={},
                     success=False,
-                    error_message=f"Command failed: {result.stderr}"
+                    error_message=f"All {self.num_runs} runs failed"
                 )
             
-            # Parse the latest summary.json file
-            summary_file = Path("thread_stats/summary.json")
-            if not summary_file.exists():
-                return ExperimentResult(
-                    config=experiment,
-                    metrics={},
-                    success=False,
-                    error_message="Summary file not found"
-                )
-            
-            with open(summary_file, 'r') as f:
-                summary_data = json.load(f)
-            
-            # Extract metrics using the same logic as run_performance_analysis.py
-            metrics = self.extract_metrics(summary_data)
-            
-            # Save raw data
-            raw_data_file = self.output_dir / "raw_data" / f"{experiment.name}.json"
-            with open(raw_data_file, 'w') as f:
-                json.dump(summary_data, f, indent=2)
+            # Average metrics across runs
+            if len(all_metrics) == 1:
+                averaged_metrics = all_metrics[0]
+            else:
+                averaged_metrics = self._average_metrics(all_metrics)
+                print(f"  Averaged {len(all_metrics)} successful runs")
             
             return ExperimentResult(
                 config=experiment,
-                metrics=metrics,
+                metrics=averaged_metrics,
                 success=True
             )
             
-        except Exception as e:
+        except subprocess.TimeoutExpired:
             return ExperimentResult(
                 config=experiment,
                 metrics={},
                 success=False,
-                error_message=str(e)
+                error_message="Experiment timed out after 600s"
+            )
+        except Exception as e:
+            import traceback
+            return ExperimentResult(
+                config=experiment,
+                metrics={},
+                success=False,
+                error_message=f"{str(e)}\n{traceback.format_exc()}"
             )
     
-    def extract_metrics(self, summary_data: Dict[str, Any]) -> Dict[str, float]:
-        """Extract metrics from summary data (same logic as run_performance_analysis.py)"""
-        metrics = {}
+    def _average_metrics(self, metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
+        """Average metrics across multiple runs"""
+        if not metrics_list:
+            return {}
         
-        # Basic metrics
-        metrics['total_attempted'] = summary_data.get('total_attempted', 0)
-        metrics['total_succeeded'] = summary_data.get('total_succeeded', 0)
-        metrics['elapsed_sec'] = summary_data.get('elapsed_sec', 0.0)
+        averaged = {}
+        all_keys = set()
+        for m in metrics_list:
+            all_keys.update(m.keys())
         
-        # Throughput metrics
-        throughput_data = summary_data.get('throughput', {})
-        if throughput_data:
-            metrics['attempted_throughput'] = throughput_data.get('attempted_ops_per_sec', 0.0)
-            metrics['succeeded_throughput'] = throughput_data.get('succeeded_ops_per_sec', 0.0)
+        for key in all_keys:
+            values = [m.get(key, 0.0) for m in metrics_list if key in m]
+            if values:
+                # Skip non-numeric values
+                if not all(isinstance(v, (int, float)) for v in values):
+                    # Just copy the first value for non-numeric fields
+                    averaged[key] = values[0]
+                    continue
+                    
+                averaged[key] = statistics.mean(values)
         
-        # Latency metrics
-        latency_data = summary_data.get('per_operation_latency', {})
-        for op_name, op_data in latency_data.items():
-            if isinstance(op_data, dict) and op_data.get('sample_count', 0) > 0:
-                if op_data.get('p50_latency_us') is not None:
-                    metrics[f'{op_name}_p50_us'] = op_data['p50_latency_us']
-                if op_data.get('p95_latency_us') is not None:
-                    metrics[f'{op_name}_p95_us'] = op_data['p95_latency_us']
-                if op_data.get('p99_latency_us') is not None:
-                    metrics[f'{op_name}_p99_us'] = op_data['p99_latency_us']
-        
-        # RDMA metrics
-        rdma_data = summary_data.get('rdma', {})
-        if rdma_data:
-            metrics['total_rtt_ms'] = rdma_data.get('total_rtt_ms', 0.0)
-            op_counts = rdma_data.get('op_counts', [])
-            if len(op_counts) >= 4:
-                metrics['rdma_read_ops'] = op_counts[0]
-                metrics['rdma_write_ops'] = op_counts[1]
-                metrics['rdma_cas_ops'] = op_counts[2]
-                metrics['rdma_faa_ops'] = op_counts[3]
-        
-        # Enhanced per-operation RDMA metrics
-        per_op_rdma = summary_data.get('per_operation_rdma_metrics', {})
-        for op_name, op_data in per_op_rdma.items():
-            if isinstance(op_data, dict):
-                # RTT distribution
-                rtt_dist = op_data.get('rtt_distribution', {})
-                if rtt_dist:
-                    metrics[f'{op_name}_avg_rtts_per_op'] = rtt_dist.get('average', 0.0)
-                
-                # RDMA operations per B+Tree operation
-                rdma_ops = op_data.get('rdma_ops_per_operation', {})
-                for rdma_type, rdma_stats in rdma_ops.items():
-                    if isinstance(rdma_stats, dict):
-                        metrics[f'{op_name}_avg_{rdma_type.lower()}_per_op'] = rdma_stats.get('average', 0.0)
-                
-                # Bytes transferred
-                bytes_data = op_data.get('bytes_transferred', {})
-                if bytes_data:
-                    metrics[f'{op_name}_avg_bytes_read'] = bytes_data.get('read_avg_bytes', 0.0)
-                    metrics[f'{op_name}_avg_bytes_written'] = bytes_data.get('written_avg_bytes', 0.0)
-        
-        return metrics
+        return averaged
     
-    def run_experiment_series(self, graph_config: Dict[str, Any]) -> Dict[str, List[ExperimentResult]]:
-        """Run all experiments for a single graph"""
-        graph_type = graph_config['type']
-        print(f"\n=== Running experiments for graph: {graph_config['title']} ===")
+    def get_metric_by_path(self, data: Dict[str, Any], path: str) -> Any:
+        """
+        Extract a metric from nested JSON using dot notation.
         
+        Examples:
+            'throughput.succeeded_ops_per_sec' -> data['throughput']['succeeded_ops_per_sec']
+            'cache.total_hit_rate' -> data['cache']['total_hit_rate']
+            'per_operation_latency.read.p99_latency_us' -> data['per_operation_latency']['read']['p99_latency_us']
+        
+        Also handles flat keys with dots (e.g., 'cache.max_size_kb' as a single key)
+        """
+        # First check if path exists as a direct key (for parameter dicts)
+        if isinstance(data, dict) and path in data:
+            return data[path]
+        
+        # Otherwise navigate nested structure
+        keys = path.split('.')
+        current = data
+        
+        for key in keys:
+            if isinstance(current, dict):
+                current = current.get(key)
+                if current is None:
+                    return None
+            else:
+                return None
+        
+        return current
+    
+    def expand_experiments(self, experiment_config: Dict[str, Any]) -> List[ExperimentConfig]:
+        """
+        Expand experiment configuration with variables dimensions.
+        New format: variables accepts arbitrary config paths (e.g., 'cache.enabled', 'distribution.type')
+        and generates cartesian product of all dimensions.
+        Supports compile_param flag for parameters requiring recompilation (KEY_SIZE, VALUE_SIZE, etc.)
+        """
+        experiments = []
+        exp_name = experiment_config['name']
+        
+        # Get variables dimensions (new generalized format)
+        # Support both 'variables' and 'variables' keys
+        variables = experiment_config.get('variables', [])
+        
+        if variables:
+            # Extract parameter paths, values, and compile flags
+            param_paths = []
+            param_values_list = []
+            compile_flags = []  # Track which parameters require compilation
+            
+            for dim in variables:
+                # Support both old 'dimension' and new 'parameter' keys
+                param_path = dim.get('parameter', dim.get('dimension'))
+                values = dim['values']
+                is_compile_param = dim.get('compile_param', False)
+                
+                param_paths.append(param_path)
+                param_values_list.append(values)
+                compile_flags.append(is_compile_param)
+            
+            # Generate cartesian product of all parameter combinations
+            for combination in itertools.product(*param_values_list):
+                # Build parameter dict for this combination
+                combo_params = {}
+                compile_params = {}  # Separate dict for compile-time parameters
+                combo_label_parts = []
+                
+                for param_path, value, is_compile in zip(param_paths, combination, compile_flags):
+                    if is_compile:
+                        # Compile parameter - track separately
+                        compile_params[param_path] = value
+                    else:
+                        # Runtime parameter - add to combo_params
+                        combo_params[param_path] = value
+                    
+                    # Create label component (use last part of path and value)
+                    param_name = param_path.split('.')[-1]
+                    combo_label_parts.append(f"{param_name}_{value}")
+                
+                # Create experiment name
+                combo_label = '_'.join(combo_label_parts)
+                experiment_name = f"{exp_name}_{combo_label}"
+                
+                experiments.append(ExperimentConfig(
+                    name=experiment_name,
+                    config_file=None,  # No base_config, use global defaults
+                    parameter_value=combo_label,
+                    parameters=combo_params,
+                    compile_params=compile_params  # Track compile parameters separately
+                ))
+        else:
+            # Simple experiment with no variations - just use defaults
+            experiments.append(ExperimentConfig(
+                name=exp_name,
+                config_file=None,
+                parameter_value=exp_name,
+                parameters={}
+            ))
+        
+        return experiments
+    
+    def run_experiment_series(self, experiment_config: Dict[str, Any]) -> Dict[str, List[ExperimentResult]]:
+        """Run all experiments for a single experiment series"""
+        exp_name = experiment_config['name']
+        print(f"\n{'='*80}")
+        print(f"Experiment Series: {exp_name}")
+        print(f"Description: {experiment_config.get('description', 'N/A')}")
+        print(f"Output Type: {experiment_config.get('output_type', 'N/A')}")
+        
+        # Check if experiment is enabled
+        if not experiment_config.get('enabled', True):
+            print(f"SKIPPED: Experiment is disabled")
+            return {}
+        
+        # Check if experiment requires special handling
+        if experiment_config.get('requires_recompile', False):
+            print(f"WARNING: This experiment requires recompilation with different compile parameters")
+            print(f"  Note: Use compile_param: true in variables for automatic recompilation")
+            return {}
+        
+        print(f"{'='*80}")
+        
+        # Expand experiments based on configuration
+        experiments = self.expand_experiments(experiment_config)
+        
+        print(f"\nTotal experiments to run: {len(experiments)}")
+        
+        # Group results by series for better organization
         all_results = {}
         
-        for series_config in graph_config['series']:
-            series_name = series_config['name']
-            print(f"\nRunning series: {series_name}")
+        # Run experiments
+        for i, experiment in enumerate(experiments, 1):
+            print(f"\n[{i}/{len(experiments)}] Running: {experiment.name}")
+            result = self.run_single_experiment(experiment)
             
-            experiments = []
-            for exp_config in series_config['experiments']:
-                experiment = ExperimentConfig(
-                    name=exp_config['name'],
-                    index_type=exp_config['index_type'],
-                    config_file=exp_config['config_file'],
-                    parameter_value=exp_config['parameter_value'],
-                    parameters=exp_config.get('parameters', {})
-                )
-                experiments.append(experiment)
+            # Group by base series name
+            series_key = experiment.name.split('_')[1] if '_' in experiment.name else experiment.name
+            if series_key not in all_results:
+                all_results[series_key] = []
+            all_results[series_key].append(result)
             
-            # Run experiments (sequential for now to avoid resource conflicts)
-            series_results = []
-            for experiment in experiments:
-                result = self.run_single_experiment(experiment)
-                series_results.append(result)
-                
-                if result.success:
-                    print(f"  ✓ {experiment.name}: succeeded_throughput={result.metrics.get('succeeded_throughput', 0):.0f} ops/s")
-                else:
-                    print(f"  ✗ {experiment.name}: FAILED - {result.error_message}")
-            
-            all_results[series_name] = series_results
+            if result.success:
+                throughput = result.metrics.get('throughput.attempted_ops_per_sec', 0)
+                p50 = result.metrics.get('global_latency.p50_latency_us', 0)
+                p99 = result.metrics.get('global_latency.p99_latency_us', 0)
+                print(f"  ✓ Success: {throughput:.0f} ops/s, P50={p50:.2f}µs, P99={p99:.2f}µs")
+            else:
+                print(f"  ✗ FAILED: {result.error_message}")
         
         return all_results
-    
-    def generate_csv_data(self, graph_config: Dict[str, Any], results: Dict[str, List[ExperimentResult]]) -> str:
-        """Generate CSV data for a graph"""
-        csv_file = self.output_dir / "csv" / f"{graph_config['type']}.csv"
+ 
+    def _clean_label(self, label: str, exp_name: str, group_by_params: List[str]) -> str:
+        """
+        Clean experiment label by removing common prefixes and group_by parameters.
+        Used consistently across all plot types.
+        """
+        # Remove experiment name prefix
+        if label.startswith(exp_name + '_'):
+            label = label[len(exp_name) + 1:]
+
+        # Remove group_by parameter values from label
+        for param_path in group_by_params:
+            param_name = param_path.split('.')[-1]
+            # Remove "paramname_value_" patterns
+            parts = label.split('_')
+            clean_parts = []
+            skip_next = False
+            for i, part in enumerate(parts):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if part == param_name and i + 1 < len(parts):
+                    skip_next = True
+                    continue
+                clean_parts.append(part)
+            label = '_'.join(clean_parts)
         
-        # Determine what metrics to include based on graph type
-        metric_columns = ['succeeded_throughput', 'insert_p50_us', 'insert_p95_us', 'insert_p99_us']
+        # Clean up any leading/trailing underscores
+        label = label.strip('_')
         
-        # Add RDMA metrics for detailed analysis
-        rdma_columns = [
-            'rdma_read_ops', 'rdma_write_ops', 'rdma_cas_ops', 'rdma_faa_ops',
-            'insert_avg_rtts_per_op', 'insert_avg_read_per_op', 'insert_avg_write_per_op',
-            'insert_avg_bytes_read', 'insert_avg_bytes_written'
-        ]
+        return label if label else 'unknown'
+
+    def dump_experiment_results(self, exp_name: str, exp_results: Dict[str, List[ExperimentResult]]):
+        """Dump experiment results to raw_data directory as one JSON file per experiment"""
+        output_file = self.output_dir / "raw_data" / f"{exp_name}_results.json"
         
-        with open(csv_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            
-            # Write header
-            header = ['series', 'param_value', 'experiment_name'] + metric_columns + rdma_columns
-            writer.writerow(header)
-            
-            # Write data rows
-            for series_name, series_results in results.items():
-                for result in series_results:
-                    if result.success:
-                        row = [
-                            series_name,
-                            result.config.parameter_value,
-                            result.config.name
-                        ]
-                        
-                        # Add metric values
-                        for col in metric_columns + rdma_columns:
-                            row.append(result.metrics.get(col, 0))
-                        
-                        writer.writerow(row)
+        # Convert results to serializable format
+        serialized = []
+        for series_key, results in exp_results.items():
+            for result in results:
+                if result.success:
+                    # Merge runtime and compile parameters for convenience
+                    all_params = {**result.config.parameters, **result.config.compile_params}
+                    serialized.append({
+                        'name': result.config.name,
+                        'parameters': all_params,
+                        'metrics': result.metrics
+                    })
         
-        return str(csv_file)
-    
-    def generate_tikz_plot(self, graph_config: Dict[str, Any], csv_file: str):
-        """Generate TikZ plot from CSV data"""
-        output_file = self.output_dir / "plots" / graph_config['tikz_output']
+        with open(output_file, 'w') as f:
+            json.dump(serialized, f, indent=2)
         
-        # Run the TikZ generator
-        cmd = [
-            sys.executable, "scripts/generate_tikz.py",
-            "--data", csv_file,
-            "--type", "line",
-            "--full-latex",
-            "--output", str(output_file)
-        ]
-        
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-            print(f"Generated TikZ plot: {output_file}")
-        except subprocess.CalledProcessError as e:
-            print(f"Failed to generate TikZ plot: {e}")
-    
-    def generate_summary_report(self, all_results: Dict[str, Dict[str, List[ExperimentResult]]]):
-        """Generate a comprehensive summary report"""
-        report_file = self.output_dir / "reports" / "summary.md"
-        
-        with open(report_file, 'w') as f:
-            f.write("# Experiment Summary Report\n\n")
-            f.write(f"Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Configuration: {self.experiments_config}\n")
-            f.write(f"Runs per experiment: {self.num_runs}\n\n")
-            
-            for graph_name, graph_results in all_results.items():
-                f.write(f"## {graph_name}\n\n")
-                
-                for series_name, series_results in graph_results.items():
-                    f.write(f"### {series_name}\n\n")
-                    f.write("| Experiment | Status | Throughput (ops/s) | P99 Latency (μs) | RDMA Ops/Op |\n")
-                    f.write("|------------|--------|-------------------|------------------|-------------|\n")
-                    
-                    for result in series_results:
-                        status = "✓" if result.success else "✗"
-                        throughput = result.metrics.get('succeeded_throughput', 0) if result.success else 0
-                        p99_latency = result.metrics.get('insert_p99_us', 0) if result.success else 0
-                        avg_rdma = result.metrics.get('insert_avg_read_per_op', 0) + result.metrics.get('insert_avg_write_per_op', 0) if result.success else 0
-                        
-                        f.write(f"| {result.config.name} | {status} | {throughput:.0f} | {p99_latency:.1f} | {avg_rdma:.1f} |\n")
-                    
-                    f.write("\n")
-        
-        print(f"Generated summary report: {report_file}")
-    
-    def run_all_experiments(self, skip_graphs: bool = False):
+        print(f"  Saved {len(serialized)} results to {output_file}")
+
+    def run_all_experiments(self, experiment_filter: Optional[str] = None):
         """Run all experiments defined in the configuration"""
-        print(f"Starting experiment runner with config: {self.experiments_config}")
+        print(f"\n{'='*80}")
+        print(f"FAUNUS EXPERIMENT RUNNER")
+        print(f"{'='*80}")
+        print(f"Configuration: {self.experiments_config}")
         print(f"Output directory: {self.output_dir}")
         print(f"Runs per experiment: {self.num_runs}")
-        print("=" * 80)
+        if experiment_filter:
+            print(f"Filter: Running only experiments matching '{experiment_filter}'")
+        print(f"{'='*80}\n")
         
-        all_results = {}
+        # Get experiment list
+        experiments_list = self.config.get('experiments', self.config.get('graphs', []))
         
-        # Run experiments for each graph
-        for graph_config in self.config['graphs']:
-            graph_results = self.run_experiment_series(graph_config)
-            all_results[graph_config['title']] = graph_results
+        # Filter experiments if requested
+        if experiment_filter:
+            experiments_list = [
+                exp for exp in experiments_list 
+                if experiment_filter.lower() in exp.get('name', '').lower()
+            ]
+            print(f"Filtered to {len(experiments_list)} experiments\n")
+        
+        # Run experiments for each series
+        total_experiments = len(experiments_list)
+        for idx, experiment_config in enumerate(experiments_list, 1):
+            exp_name = experiment_config.get('name', f'experiment_{idx}')
+            print(f"\n{'#'*80}")
+            print(f"# Experiment {idx}/{total_experiments}: {exp_name}")
+            print(f"{'#'*80}")
             
-            # Generate CSV and plots
-            if not skip_graphs:
-                csv_file = self.generate_csv_data(graph_config, graph_results)
-                self.generate_tikz_plot(graph_config, csv_file)
-        
-        # Generate summary report
-        self.generate_summary_report(all_results)
+            try:
+                exp_results = self.run_experiment_series(experiment_config)
+                self.dump_experiment_results(exp_name, exp_results)
+                
+            except Exception as e:
+                print(f"\nERROR: Experiment {exp_name} failed: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
         
         print("\n" + "=" * 80)
-        print("Experiment run completed successfully!")
+        print("EXPERIMENT RUN COMPLETED")
+        print("=" * 80)
         print(f"Results available in: {self.output_dir}")
         print(f"  - CSV data: {self.output_dir}/csv/")
-        print(f"  - TikZ plots: {self.output_dir}/plots/")
-        print(f"  - Reports: {self.output_dir}/reports/")
         print(f"  - Raw data: {self.output_dir}/raw_data/")
+        print("=" * 80)
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Run comprehensive experiments and generate publication plots",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python3 experiment_runner.py --config experiments.yaml
-  python3 experiment_runner.py --config experiments.yaml --output-dir custom_results/
-  python3 experiment_runner.py --config experiments.yaml --runs 5 --skip-graphs
-        """
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
     parser.add_argument('--config', required=True, help='Path to experiments YAML configuration')
     parser.add_argument('--output-dir', default='experiment_results', help='Output directory for results')
-    parser.add_argument('--runs', type=int, default=3, help='Number of runs per experiment')
-    parser.add_argument('--parallel', type=int, default=1, help='Number of parallel experiments')
-    parser.add_argument('--skip-graphs', action='store_true', help='Skip graph generation')
+    parser.add_argument('--filter', type=str, help='Run only experiments matching this name filter')
+    parser.add_argument('--run-only', action='store_true', help='Skip plot generation')
+    parser.add_argument('--plot-only', action='store_true', help='Skip experiment execution, only generate plots from existing data')
     
     args = parser.parse_args()
     
@@ -400,15 +647,52 @@ Examples:
         sys.exit(1)
     
     try:
-        runner = ExperimentRunner(
-            experiments_config=args.config,
-            output_dir=args.output_dir,
-            num_runs_per_experiment=args.runs,
-            parallel_experiments=args.parallel
-        )
-        runner.run_all_experiments(skip_graphs=args.skip_graphs)
+        if not args.plot_only:
+            runner = ExperimentRunner(
+                experiments_config=args.config
+            )
+            runner.run_all_experiments(experiment_filter=args.filter)
+
+        if not args.run_only:
+            # Load config to get experiment definitions
+            with open(args.config, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            data_dir = Path(args.output_dir)
+            assert data_dir.exists(), f"Data root directory does not exist: {data_dir}"
+            
+            # Filter experiments if requested
+            experiments_list = config.get('experiments', [])
+            if args.filter:
+                experiments_list = [
+                    exp for exp in experiments_list 
+                    if args.filter.lower() in exp.get('name', '').lower()
+                ]
+            
+            # Generate plots for each experiment
+            for exp_config in experiments_list:
+                exp_name = exp_config['name']
+                results_file = data_dir / "raw_data" / f"{exp_name}_results.json"
+                
+                if not results_file.exists():
+                    print(f"Skipping {exp_name}: no results file found")
+                    continue
+                
+                # Load results
+                with open(results_file, 'r') as f:
+                    results = json.load(f)
+                
+                # Generate plots for each output configuration
+                outputs = exp_config.get('outputs', [])
+                for output_cfg in outputs:
+                    print(f"Generating plot: {exp_name} / {output_cfg['name']}")
+                    generate_plots(output_cfg, results, str(data_dir / "plots"))
+
+
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

@@ -27,6 +27,7 @@ thread_stats/
 results/
 output/
 benchmark_results/
+experiment_results/
 profiling_results/
 .profile_venv/
 *.perf
