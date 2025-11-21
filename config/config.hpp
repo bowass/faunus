@@ -66,8 +66,8 @@ struct IndexConfig {
     std::string index = "faunus";
     DistributionConfig distribution;
     bool use_cache = true;
-    size_t max_cs_cache_size_kb = 32;
-    size_t max_mcs_cache_size_kb = 32;
+    size_t max_cs_cache_size_kb = 1024;
+    size_t max_mcs_cache_size_kb = 1024;
 };
 
 inline IndexConfig load_config(const std::string& yaml_path) {
@@ -123,7 +123,10 @@ inline IndexConfig load_config(const std::string& yaml_path) {
     if (node["cache"]) {
         auto cache_node = node["cache"];
         if (cache_node["enabled"]) cfg.use_cache = cache_node["enabled"].as<bool>();
-        if (cache_node["max_size_kb"]) cfg.max_cs_cache_size_kb = cache_node["max_size_kb"].as<size_t>();
+        if (cache_node["max_size_kb"]) {
+            // overrides both CS and MCS cache sizes
+            cfg.max_mcs_cache_size_kb = cfg.max_cs_cache_size_kb = cache_node["max_size_kb"].as<size_t>();
+        }
         if (cache_node["max_mcs_size_kb"]) cfg.max_mcs_cache_size_kb = cache_node["max_mcs_size_kb"].as<size_t>();
     }
 
