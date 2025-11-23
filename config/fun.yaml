@@ -1,15 +1,18 @@
-num_cs: 2
-threads_per_cs: 1
-num_ms: 1
-mem_per_ms: 8589934592
+# num_cs: 8
+num_cs: 8
+# threads_per_cs: 8
+threads_per_cs: 8
+num_ms: 4 # 8
+mem_per_ms: 4294967296 # 8589934592
 base_rtt_ns: 300
 initial_slabs_per_size: 32768
 maintenance_cs: 1
 threads_per_maintenance_cs: 1
 # log_level: ERROR
 log_level: ERROR
-ops_per_client: 100000
-warmup_inserts: 10000000
+ops_per_client: 25600
+warmup_inserts: 25600000
+# warmup_inserts: 268435456 # 256M entries
 # CPU core binding configuration
 cpu_binding_enabled: false
 cpu_binding_start_core: 0

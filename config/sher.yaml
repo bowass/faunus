@@ -1,0 +1,25 @@
+# num_cs: 8
+num_cs: 4
+# threads_per_cs: 8
+threads_per_cs: 2
+num_ms: 8
+mem_per_ms: 8589934592
+base_rtt_ns: 300
+initial_slabs_per_size: 32768
+
+maintenance_cs: 1
+threads_per_maintenance_cs: 1
+
+log_level: ERROR
+
+ops_per_client: 32768
+warmup_inserts: 33554432
+
+distribution:
+  type: uniform
+  key_space: 10000000
+preset: write-only
+cache:
+  enabled: true
+  max_size_kb: 524288
+index: "sherman"
