@@ -56,9 +56,9 @@ public:
     
     // Copy constructor
     HistogramLatencySampler(const HistogramLatencySampler& other) : 
+        buckets_(other.buckets_),
         total_samples_(other.total_samples_), 
-        overflow_samples_(other.overflow_samples_),
-        buckets_(other.buckets_) {
+        overflow_samples_(other.overflow_samples_) {
     }
     
     void add_sample(double latency_us) {
