@@ -11,46 +11,25 @@ paths:
   summary_file: "thread_stats/summary.json"
   output_dir: "experiment_results"
 
-
-# defaults:
-#   num_cs: 8
-#   threads_per_cs: 8
-#   num_ms: 8
-#   maintenance_cs: 1
-#   threads_per_maintenance_cs: 1
-#   mem_per_ms: 8589934592  # 8GB
-#   base_rtt_ns: 300
-  
-#   warmup_inserts: 10000000  # 10 Million
-#   ops_per_client: 1000000   # 1M operations per client
-  
-#   cache:
-#     enabled: true
-#     max_size_kb: 524288  # 512MB
-#     max_mcs_size_kb: 4096
-  
-#   cpu_binding_enabled: false
-#   log_level: INFO
-
-
 defaults:
-  num_cs: 2
-  threads_per_cs: 2
-  num_ms: 1
+  num_cs: 8
+  threads_per_cs: 8
+  num_ms: 8
+  mem_per_ms: 8589934592
+  base_rtt_ns: 300
+
   maintenance_cs: 1
   threads_per_maintenance_cs: 1
-  mem_per_ms: 1073741824
-  base_rtt_ns: 300
-  
-  warmup_inserts: 100000
-  ops_per_client: 100000
+
+  warmup_inserts: 33554432
+  ops_per_client: 32768
 
   cache:
     enabled: true
     max_size_kb: 524288  # 512MB
   
   cpu_binding_enabled: false
-  log_level: INFO
+  log_level: ERROR
 
 experiments:
   # ============================================================================
@@ -62,15 +41,12 @@ experiments:
     
     variables:
       - parameter: "index"
-        values: ["sherman", "faunus"]
-      - parameter: "cache.enabled"
-        values: [false, true]
+        # values: ["sherman", "faunus"]
+        values: ["faunus"]
       - parameter: "distribution.type"
-        # values: ["uniform", "skewed"]
-        values: ["skewed"]
+        values: ["uniform", "skewed"]
       - parameter: "preset"
-        # values: ["write-only", "write-intensive", "read-intensive"]
-        values: ["write-intensive"]
+        values: ["write-only", "write-intensive", "read-intensive"]
     
     outputs:
       - name: "throughput_latency"
@@ -172,13 +148,14 @@ experiments:
     
     variables:
       - parameter: "threads_per_cs"
-        values: [1, 2, 4, 8]
+        values: [1, 2, 4, 6, 8, 10, 12, 14, 16]
       - parameter: "index"
+        # values: ["faunus", "sherman"]
         values: ["faunus"]
       - parameter: "distribution.type"
         values: ["uniform", "skewed"]
       - parameter: "preset"
-        values: ["write-only", "write-intensive", "read-intensive"]
+        values: ["write-intensive", "read-intensive"]
     
     outputs:
       - name: "throughput_latency_vs_threads"
@@ -210,17 +187,14 @@ experiments:
     
     variables:
       - parameter: "cache.max_size_kb"
-        values: [1024, 4096, 16384, 65536, 131072, 262144, 524288]  # 1MB to 512MB
+        values: [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288]  # 1MB to 512MB
       - parameter: "index"
+        # values: ["faunus", "sherman"]
         values: ["faunus"]
-      - parameter: "cache.enabled"
-        values: [true]
       - parameter: "distribution.type"
-        # values: ["uniform", "skewed"]
-        values: ["uniform"]
+        values: ["uniform", "skewed"]
       - parameter: "preset"
-        # values: ["write-only", "write-intensive", "read-intensive"]
-        values: ["write-only"]
+        values: ["write-intensive"]
     
     outputs:
       - name: "throughput_and_hit_rate"
@@ -257,12 +231,10 @@ experiments:
         # values: ["sherman", "faunus"]
         values: ["faunus"]
       - parameter: "distribution.type"
-        # values: ["uniform", "skewed"]
-        values: ["uniform"]
+        values: ["uniform", "skewed"]
       - parameter: "preset"
-        # values: ["write-only", "write-intensive", "read-intensive"]
-        values: ["write-only"]
-    
+        values: ["write-intensive", "read-intensive"]
+
     outputs:
       - name: "throughput_vs_key_size"
         type: "line"
@@ -274,8 +246,17 @@ experiments:
           label_format: "K{KEY_SIZE}_V{VALUE_SIZE}"
         y_axes:
           - metric: "throughput.attempted_ops_per_sec"
+            axis: "left"
             label: "Throughput (ops/s)"
             plot_type: "bar"
+          - metric: "global_latency.p50_latency_us"
+            metric_label: "P50"
+            axis: "right"
+            label: "Latency (μs)"
+          - metric: "global_latency.p99_latency_us"
+            metric_label: "P99"
+            axis: "right"
+            label: "Latency (μs)"
 
   # ============================================================================
   # 5. Maintenance Scaling: Different MCS counts and threads
@@ -309,8 +290,17 @@ experiments:
           label_format: "{maintenance_cs}_{threads_per_maintenance_cs}"
         y_axes:
           - metric: "throughput.attempted_ops_per_sec"
+            axis: "left"
             label: "Throughput (ops/s)"
             plot_type: "bar"
+          - metric: "global_latency.p50_latency_us"
+            metric_label: "P50"
+            axis: "right"
+            label: "Latency (μs)"
+          - metric: "global_latency.p99_latency_us"
+            metric_label: "P99"
+            axis: "right"
+            label: "Latency (μs)"
 
   # ============================================================================
   # 6. MCS vs Client SMOs
@@ -325,11 +315,9 @@ experiments:
       - parameter: "index"
         values: ["faunus"]
       - parameter: "distribution.type"
-        # values: ["uniform", "skewed"]
-        values: ["uniform"]
+        values: ["uniform", "skewed"]
       - parameter: "preset"
-        # values: ["write-only", "write-intensive"]
-        values: ["write-only"]
+        values: ["write-intensive"]
     
     outputs:
       - name: "throughput_mcs_vs_client"
@@ -340,5 +328,57 @@ experiments:
           label: "Maintenance Mode"
         y_axes:
           - metric: "throughput.attempted_ops_per_sec"
+            axis: "left"
             label: "Throughput (ops/s)"
             plot_type: "bar"
+          - metric: "global_latency.p50_latency_us"
+            metric_label: "P50"
+            axis: "right"
+            label: "Latency (μs)"
+          - metric: "global_latency.p99_latency_us"
+            metric_label: "P99"
+            axis: "right"
+            label: "Latency (μs)"
+
+  # ============================================================================
+  # 7. Faunus: branch factor and split watermark
+  # ============================================================================
+  - name: "branch_factor-split_watermark"
+    description: "Compare MCS-based maintenance vs client-performed SMOs"
+    
+    variables:
+      - parameter: "FAUNUS_BRANCH_FACTOR"
+        values: [16, 32, 64, 128]
+        compile_param: true
+      - parameter: "FAUNUS_SPLIT_WATERMARK"
+        values: [0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+        compile_param: true
+      - parameter: "index"
+        values: ["faunus"]
+      - parameter: "distribution.type"
+        values: ["uniform", "skewed"]
+      - parameter: "preset"
+        values: ["write-intensive"]
+
+    outputs:
+      - name: "tput_lat-branch_factor-split_watermark"
+        title: "Throughput: MCS vs Client SMOs"
+        series_by: ["distribution.type", "preset"]
+        annotate_values: true
+        x_axis:
+        x_axis:
+          label: "Branch Factor and Split Watermark"
+          label_format: "BF{FAUNUS_BRANCH_FACTOR}_SW{FAUNUS_SPLIT_WATERMARK}"
+        y_axes:
+          - metric: "throughput.attempted_ops_per_sec"
+            axis: "left"
+            label: "Throughput (ops/s)"
+            plot_type: "bar"
+          - metric: "global_latency.p50_latency_us"
+            metric_label: "P50"
+            axis: "right"
+            label: "Latency (μs)"
+          - metric: "global_latency.p99_latency_us"
+            metric_label: "P99"
+            axis: "right"
+            label: "Latency (μs)"
