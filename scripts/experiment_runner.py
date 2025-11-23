@@ -22,6 +22,7 @@ import subprocess
 import shutil
 import tempfile
 import itertools
+import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -205,7 +206,7 @@ class ExperimentRunner:
             print(f"    Clean command failed: {result.stderr}")
             return False
 
-        build_cmd = [self.build_command, self.build_target, '-j', '6'] + build_flags
+        build_cmd = [self.build_command, self.build_target, '-j'] + build_flags
         print(f"    Running: {' '.join(build_cmd)}")
         result = subprocess.run(build_cmd, capture_output=True, text=True, timeout=300)
 
@@ -279,9 +280,20 @@ class ExperimentRunner:
                 # Run executable directly
                 cmd = [self.executable, temp_config]
                 
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-                
-                if result.returncode != 0:
+                # retry in a loop
+                max_failing_attempts = 10
+                success = False
+                for attempt in range(max_failing_attempts):
+                    print(f"    Attempt {attempt}/{max_failing_attempts}")
+                    secs_to_sleep = 10
+                    print(f"Sleeping for {secs_to_sleep}s")
+                    time.sleep(secs_to_sleep)
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                    
+                    if result.returncode == 0:
+                        print(f"    Successful attempt!")
+                        success = True
+                        break
                     stderr_msg = result.stderr.strip()
                     stdout_msg = result.stdout.strip()
                     print(f"    Warning: Run {run_idx + 1} failed (exit code {result.returncode})")
@@ -289,6 +301,8 @@ class ExperimentRunner:
                         print(f"    STDERR: {stderr_msg[:300]}")
                     if stdout_msg:
                         print(f"    STDOUT (last 200 chars): ...{stdout_msg[-200:]}")
+                
+                if not success:
                     continue
                 
                 # Parse the latest summary file
@@ -657,7 +671,7 @@ def main():
             # Load config to get experiment definitions
             with open(args.config, 'r') as f:
                 config = yaml.safe_load(f)
-            
+
             data_dir = Path(args.output_dir)
             assert data_dir.exists(), f"Data root directory does not exist: {data_dir}"
             
