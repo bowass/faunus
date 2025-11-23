@@ -121,6 +121,8 @@ int main(int argc, char* argv[]) {
     }
     // Create RDMA manager
     auto rdma_mgr = std::make_shared<RDMAManager>(mem_servers, mem_per_server, base_rtt_ns);
+    // initially no sleep
+    rdma_mgr->set_sleep(false);
 
     LOG_INFO("\n====================== KV-index RDMA Stress Test ======================");
     const size_t num_cs = config.num_cs;
@@ -350,6 +352,9 @@ int main(int argc, char* argv[]) {
                 size_t count = warmup_counter.fetch_add(1) + 1;
                 if (count == total_clients) {
                     // Last thread to arrive - notify all waiting threads
+                    // enables RDMAManager sleep
+                    std::cout << "Warmup is done!" << std::endl;
+                    rdma_mgr->set_sleep(true);
                     warmup_cv.notify_all();
                     benchmark_start = std::chrono::steady_clock::now();
                 } else {
