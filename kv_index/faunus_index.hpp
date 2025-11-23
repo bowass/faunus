@@ -26,7 +26,7 @@
  * Default: 32
  */
 #ifndef FAUNUS_BRANCH_FACTOR
-#define FAUNUS_BRANCH_FACTOR 32
+#define FAUNUS_BRANCH_FACTOR 64
 #endif
 
 /**
@@ -37,7 +37,7 @@
  * Default: 0.75 (75% full)
  */
 #ifndef FAUNUS_SPLIT_WATERMARK
-#define FAUNUS_SPLIT_WATERMARK 0.75
+#define FAUNUS_SPLIT_WATERMARK 0.9
 #endif
 
 // Compile-time validation
