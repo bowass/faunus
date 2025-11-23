@@ -73,11 +73,19 @@ public:
      * @return Pointer to MemoryServer
      */
     std::shared_ptr<MemoryServer> get_server(const GlobalAddress& gaddr, size_t& local_addr);
+
+    bool is_sleep_enabled() const;
+    void set_sleep(bool sleep_enabled);
 private:
     std::vector<std::shared_ptr<MemoryServer>> mem_servers_;
     size_t mem_per_server_;
     const uint64_t base_rtt_ns_;
+    bool sleep_enabled_;
     static constexpr uint64_t SIMULATED_BW_BPS = 12500000000ULL; // 100Gbps
+
+    // queueing delay simulation
+    std::unordered_map<std::shared_ptr<MemoryServer>, std::atomic<uint64_t>> server_finish_times_;
+
     struct RDMAThreadStats {
         RDMAThreadStats() : thread_id(std::this_thread::get_id()) {}
         std::thread::id thread_id;
@@ -103,6 +111,12 @@ private:
      * @return true if successful, false otherwise
      */
     bool execute_rdma(RDMAOp& op);
+
+    // Helper function to calculate and absorb the queueing delay for a single op
+    // Returns the total time the operation will spend *at the server* (T_queue + T_trans)
+    uint64_t get_server_time_delay(const std::shared_ptr<MemoryServer>& server, uint64_t T_trans);
+
+    inline void sleep_ns(const uint64_t interval);
 };
 
 template<typename T>

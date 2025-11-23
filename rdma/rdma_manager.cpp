@@ -110,8 +110,22 @@ RDMAManager::RDMAThreadStats& RDMAManager::ensure_thread_stats() const {
 }
 
 RDMAManager::RDMAManager(const std::vector<std::shared_ptr<MemoryServer>>& mem_servers, size_t mem_per_server, uint64_t base_rtt_ns)
-    : mem_servers_(mem_servers), mem_per_server_(mem_per_server), base_rtt_ns_(base_rtt_ns) {
+    : mem_servers_(mem_servers), mem_per_server_(mem_per_server), base_rtt_ns_(base_rtt_ns), sleep_enabled_(true) {
     reset_stats();
+}
+
+bool RDMAManager::is_sleep_enabled() const {
+    return sleep_enabled_;
+}
+
+void RDMAManager::set_sleep(bool sleep_enabled) {
+    sleep_enabled_ = sleep_enabled;
+}
+
+inline void RDMAManager::sleep_ns(const uint64_t interval) {
+    if (sleep_enabled_) {
+        util::precise_sleep_ns(interval);
+    }
 }
 
 std::shared_ptr<MemoryServer> RDMAManager::get_server(const GlobalAddress& gaddr, size_t& local_addr) {
@@ -143,30 +157,24 @@ bool RDMAManager::perform_op(RDMAOp& op) {
 
     const uint64_t one_way_ns = base_rtt_ns_ / 2;
 
-    util::precise_sleep_ns(one_way_ns);
-
-    // acquiring simulates contention delay
-    // auto [server_lock, contention_ns] = acquire_server_lock(server);
-    // server_lock.unlock();
-    // TODO: THIS SERIALIZES EVERYTHING - MAY BE VERY BAD
-    const uint64_t contention_ns = 0; // TODO: set contention_ns from above
-
     const uint64_t bw_delay_ns = calculate_bw_delay_ns(op);
 
-    // Simulate bandwidth delay
-    util::precise_sleep_ns(bw_delay_ns);
+    auto server_delay = get_server_time_delay(server, bw_delay_ns);
+
+    uint64_t pre_op_sleep = one_way_ns + server_delay;
+
+    sleep_ns(pre_op_sleep);
 
     bool result = execute_rdma(op);
     
+    uint64_t post_op_sleep = one_way_ns + (op.type == RDMAOpType::READ ? bw_delay_ns : 0);
     // Second RTT half
-    // TODO: add async write support
-    util::precise_sleep_ns(one_way_ns + bw_delay_ns);
+    sleep_ns(post_op_sleep);
 
     auto& stats = ensure_thread_stats();
     stats.op_counts[static_cast<size_t>(op.type)]++;
-    // TODO: add async write support
-    stats.total_rtt_ns += 2 * one_way_ns + contention_ns;
-    
+    stats.total_rtt_ns += pre_op_sleep + post_op_sleep;
+
     // Track operation in enhanced stats if tracker is set
     if (thread_stats_tracker_) {
         thread_stats_tracker_->record_rdma_op(op);
@@ -188,16 +196,11 @@ bool RDMAManager::perform_batch(std::vector<RDMAOp>& ops) {
     
     // 1. Simulate Batch Issue Time (Wall-clock sleep for the outgoing trip)
     const uint64_t one_way_ns = base_rtt_ns_ / 2;
-    util::precise_sleep_ns(one_way_ns); 
+    sleep_ns(one_way_ns); 
 
     // --- Critical Path Tracking ---
     uint64_t max_server_path_ns = 0; // Max time spent on a single server's path (Contention + BW)
-    uint64_t max_return_trip_ns = 0; // Max return trip for synchronous ops
 
-    // Stores the total accumulated execution time (Contention + BW) for each server.
-    // This models the serialization of requests *at the server* for this specific batch.
-    std::unordered_map<std::shared_ptr<MemoryServer>, uint64_t> server_busy_until_ns;
-    
     // 2. Execution and Contention Modeling Phase (Serial Loop to issue/model ops)
     for (RDMAOp& op : ops) {
         size_t local_addr;
@@ -208,19 +211,12 @@ bool RDMAManager::perform_batch(std::vector<RDMAOp>& ops) {
             return false;
         }
 
-        // --- Contention Measurement (Control Plane Handshake) ---
-        // Acquire lock just to measure wait time, then release immediately.
-        // This models the contention for the server's control-plane resource.
-        // TODO: we acquire in a serial manner, assert that this is acceptable
-        // auto [server_lock, contention_ns] = acquire_server_lock(server);
-        // server_lock.unlock(); // Release immediately (crucial fix)
-        uint64_t contention_ns = 0; // TODO: set contention_ns from above
-
         // --- Execution Latency (BW Delay) ---
         uint64_t bw_delay_ns = calculate_bw_delay_ns(op);
 
-        // Accumulate time on the specific server's path (models serial execution at the server)
-        server_busy_until_ns[server] += bw_delay_ns;
+        uint64_t server_delay = get_server_time_delay(server, bw_delay_ns);
+
+        max_server_path_ns = std::max(max_server_path_ns, server_delay);
 
         // --- Execution Phase (Local Copy) ---
         RDMAOp local_op = op;
@@ -233,34 +229,16 @@ bool RDMAManager::perform_batch(std::vector<RDMAOp>& ops) {
         }
 
         // --- RTT and Stats Update ---
-        uint64_t op_return_trip_ns = 0;
-
-        op_return_trip_ns = one_way_ns;
-        // Track the maximum return trip time for the final wall-clock wait
-        max_return_trip_ns = std::max(max_return_trip_ns, op_return_trip_ns);
-
         // Stats update (Individual op latency is calculated for accumulation)
         stats.op_counts[static_cast<size_t>(op.type)]++;
-        // stats.total_contention_ns += contention_ns;
         
         // Total latency attributed to this single operation for statistics
-        uint64_t op_total_latency_ns = one_way_ns + contention_ns + bw_delay_ns + op_return_trip_ns;
-        stats.total_rtt_ns += op_total_latency_ns;
+        stats.total_rtt_ns += one_way_ns + server_delay + one_way_ns;
     }
 
-    // 3. Determine and Apply Critical Path Delay (Wall-clock wait)
-    // The client thread now waits for the duration of the execution time on the slowest server.
-    for (const auto& pair : server_busy_until_ns) {
-        max_server_path_ns = std::max(max_server_path_ns, pair.second);
-    }
-    
-    // Wait for the total time required by the slowest server's serial execution path.
-    // This correctly models the parallel execution of the batch.
-    util::precise_sleep_ns(max_server_path_ns); 
-    
     // 4. Simulate Final Return Trip Wait
     // Wait for the completion of the slowest synchronous request.
-    util::precise_sleep_ns(max_return_trip_ns);
+    sleep_ns(max_server_path_ns + one_way_ns);
 
         // Track operation in enhanced stats if tracker is set
     if (thread_stats_tracker_) {
@@ -338,4 +316,62 @@ bool rdma_cas_release_lock(RDMAManager& rdma_mgr, GlobalAddress lock_address) {
     op.op.write.bytes = sizeof(uint64_t);
     
     return rdma_mgr.perform_op(op);
+}
+
+/**
+ * @brief Retrieves the current time in nanoseconds from a steady (monotonic) clock.
+ * @return uint64_t The current time, in nanoseconds.
+ */
+inline uint64_t get_current_time_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+}
+
+// Helper function to calculate and absorb the queueing delay for a single op
+// Returns the total time the operation will spend *at the server* (T_queue + T_trans)
+uint64_t RDMAManager::get_server_time_delay(
+    const std::shared_ptr<MemoryServer>& server, 
+    uint64_t T_trans) 
+{
+    // 1. Get the atomic finish time tracker for the target server
+    auto it = server_finish_times_.find(server);
+    if (it == server_finish_times_.end()) {
+        // Initialize the finish time if not found (assuming this happens at startup)
+        // For robustness: initialize if missing. Use 0 as the server is free at time 0.
+        it = server_finish_times_.emplace(server, 0ULL).first;
+    }
+    
+    std::atomic<uint64_t>& finish_time_ref = it->second;
+    
+    // 2. Get the current wall-clock time (in ns)
+    // NOTE: This function call MUST be extremely fast (e.g., a simple read from a high-res timer).
+    const uint64_t T_now = get_current_time_ns(); // ASSUMED FAST HELPER
+    
+    uint64_t T_prev_finish = finish_time_ref.load();
+    uint64_t T_expected_finish;
+    
+    // --- Atomic Compare-and-Swap Loop for Zero Overhead Contention ---
+    do {
+        // T_prev_finish holds the expected completion time of the last queued job.
+        
+        // Calculate when the server is actually free to start the current job.
+        // It must be at least T_now, otherwise the server is currently idle/free.
+        // The max() operation prevents T_queue from becoming negative.
+        uint64_t T_server_free = (T_prev_finish > T_now) ? T_prev_finish : T_now;
+        
+        // Calculate the new time the server will be busy until (T_server_free + T_trans)
+        // This is the value we try to write back to the atomic.
+        T_expected_finish = T_server_free + T_trans;
+        
+    } while (!finish_time_ref.compare_exchange_weak(T_prev_finish, T_expected_finish));
+    
+    // 3. Calculate Queueing Delay (T_queue)
+    // The delay is the time remaining until the server clears the job that was previously last (T_prev_finish).
+    // If T_prev_finish <= T_now, the server is idle, and T_queue is 0.
+    const uint64_t T_queue = (T_prev_finish > T_now) ? (T_prev_finish - T_now) : 0ULL;
+        
+    // The return value for perform_op/perform_batch is T_queue + T_trans,
+    // which represents the total time this operation takes up on the server path.
+    return T_queue + T_trans;
 }
