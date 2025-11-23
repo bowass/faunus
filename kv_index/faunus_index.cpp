@@ -59,8 +59,8 @@ bool FaunusIndex::initialize(size_t num_maintenance_queues) {
 
     // initialize maintenance
     if (num_maintenance_queues > 0) {
-        set_maintenance_queued_sets(create_maintenance_queued_sets(num_maintenance_queues));
-        // FaunusIndex::set_maintenance_queues(FaunusIndex::create_maintenance_queues(num_maintenance_queues));
+        // set_maintenance_queued_sets(create_maintenance_queued_sets(num_maintenance_queues));
+        FaunusIndex::set_maintenance_queues(FaunusIndex::create_maintenance_queues(num_maintenance_queues));
     }
     return success;
 }
@@ -164,7 +164,7 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
             rdma_read_object(*rdma_mgr_, node_address, node);
             // Add to cache if it's at the target cache level (one level above leaves)
             // TODO: change 1 to configurable target level
-            if (faunus_cache_ && !node.header.lock && (node.header.level == 1 + from_smo)) {
+            if (faunus_cache_ && !node.header.lock && (node.header.level == uint64_t(1 + from_smo))) {
                 faunus_cache_->add(node.header.fence.first, node.header.fence.second, {node_address, node});
             }
         }
@@ -209,7 +209,7 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
         if (!found) {
             next_address = node.entries[node.header.last_index].child;
         }
-
+        assert(node_address != next_address);
         node_address = next_address;
         in_root = false;
         // Found - node_address is the right child
@@ -466,6 +466,7 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
 
         // using from_insert == false, we do not care about duplicates here
         auto candidate_kvs = get_candidate_kvs(leaf, fp, success, false, false);
+        // LOG_DEBUG("k=" << key << " god cand kvs");
         // smo - retry
         if (candidate_kvs.empty() && !success) {
             continue;
@@ -491,15 +492,16 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         uint64_t seed = mix64(tid_hash ^ attempt);
 
         bool found_free = false;
+        bool found_locked = false;
         success = false;
-        for (size_t i = 0; !found_free && (i < branch_factor); i++) {
+        for (size_t i = 0; !found_free && !(found_locked) && (i < branch_factor); i++) {
             // each thread traverses the entries in a different order based on its id
             size_t index = (i ^ seed) & (branch_factor - 1);
             // break to continue in the mainloop
             if (leaf.kv_blocks[index].isLocked()) {
-                break;
+                found_locked = true;
             }
-            if (leaf.kv_blocks[index].isFree()) {
+            else if (leaf.kv_blocks[index].isFree()) {
                 found_free = true;
                 // update KVBlock using CAS and re-read the leaf back-to-back
                 GlobalAddress kvblock_address = leaf_address + OFFSET_OF_ARRAY_ELEM(LeafNode, kv_blocks, index);
@@ -528,6 +530,13 @@ bool FaunusIndex::insert(const Key& key, const Value& value) {
         // successful insertions will incur SMO
         // continue retrying
         if (!success) {
+// NOTE: this tried to replace the preemptive SMO - seems to worsen performance
+// #ifndef FAUNUS_MAINTENANCE_ENABLED
+//             // split if needed
+//             if (!found_free) {
+//                 split_leaf(leaf_address);
+//             }
+// #endif
             continue;
         }
         // leaf is already updated
@@ -655,7 +664,7 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
 
     std::vector<std::pair<Key, KVBlock>> entries(entries_map.begin(), entries_map.end());
 
-    for (int i = 0; i < entries.size() - 1; i++) {
+    for (size_t i = 0; i < entries.size() - 1; i++) {
         assert(entries[i].first < entries[i + 1].first);
     }
 
@@ -721,7 +730,6 @@ bool FaunusIndex::split_leaf(GlobalAddress leaf_address) {
 }
 
 bool FaunusIndex::insert_internal_entry(const Key& key, GlobalAddress new_child_addr, size_t level) {
-    bool success;
     GlobalAddress node_address;
     InternalNode node;
     Entry<Key, FaunusCacheItem>* cached_entry = nullptr;
@@ -933,35 +941,35 @@ bool FaunusIndex::setup_new_root(const Key& key, GlobalAddress right_child, size
 bool FaunusIndex::request_smo(FaunusMaintenanceRPC::OpType op, GlobalAddress leaf_address) {
 #ifdef FAUNUS_MAINTENANCE_ENABLED
     // Prefer queued-sets if available (prevents duplicates)
-    size_t num_queued_sets = num_maintenance_queued_sets();
-    // size_t num_queues = num_maintenance_queues();
-    if (num_queued_sets > 0) {
-        size_t queue_idx = std::hash<uint64_t>{}(leaf_address.raw) % num_queued_sets;
-        auto queued_set = get_maintenance_queued_set(queue_idx);
-        if (queued_set) {
-            FaunusMaintenanceRPC rpc{.op=op, .leaf_address=leaf_address};
-            {
-                Profiler::Scoped scope("faunus.request_smo.try_enqueue");
-                queued_set->try_enqueue(std::move(rpc));
-                // bool enqueued = 
-            }
-            return true; // Always return true since either it was enqueued or already pending
-        }
-    }
+    // size_t num_queued_sets = num_maintenance_queued_sets();
+    // // size_t num_queues = num_maintenance_queues();
+    // if (num_queued_sets > 0) {
+    //     size_t queue_idx = std::hash<uint64_t>{}(leaf_address.raw) % num_queued_sets;
+    //     auto queued_set = get_maintenance_queued_set(queue_idx);
+    //     if (queued_set) {
+    //         FaunusMaintenanceRPC rpc{.op=op, .leaf_address=leaf_address};
+    //         {
+    //             Profiler::Scoped scope("faunus.request_smo.try_enqueue");
+    //             queued_set->try_enqueue(std::move(rpc));
+    //             // bool enqueued = 
+    //         }
+    //         return true; // Always return true since either it was enqueued or already pending
+    //     }
+    // }
     
     // Fallback to regular maintenance queues (legacy behavior)
-    // size_t num_queues = num_maintenance_queues();
-    // if (num_queues == 0) return std::cout << "got num_queues 0" << std::endl, false;
-    // size_t queue_idx = std::hash<uint64_t>{}(leaf_address.raw) % num_queues;
-    // auto queue = get_maintenance_queue(queue_idx);
-    // if (!queue) {
-    //     return std::cout << "got null queue" << std::endl, false;
-    //     // return false;
-    // }
-    // FaunusMaintenanceRPC rpc{.op=op, .leaf_address=leaf_address};
-    // {
-    //     queue->enqueue(std::move(rpc));
-    // }
+    size_t num_queues = num_maintenance_queues();
+    if (num_queues == 0) return std::cout << "got num_queues 0" << std::endl, false;
+    size_t queue_idx = std::hash<uint64_t>{}(leaf_address.raw) % num_queues;
+    auto queue = get_maintenance_queue(queue_idx);
+    if (!queue) {
+        return std::cout << "got null queue" << std::endl, false;
+        // return false;
+    }
+    FaunusMaintenanceRPC rpc{.op=op, .leaf_address=leaf_address};
+    {
+        queue->enqueue(std::move(rpc));
+    }
 #endif // FAUNUS_MAINTENANCE_ENABLED
     return true;
 }
