@@ -1,6 +1,14 @@
 
 CXX = g++
-CXXFLAGS = -std=c++17 -O2 -Wall -pthread -Iinclude -Irdma -g
+CXXFLAGS = -std=c++17 -Wall -pthread -Iinclude -Irdma -g -O2
+LDFLAGS = -lyaml-cpp
+
+YAMLCPP ?= $(shell spack location -i yaml-cpp 2>/dev/null)
+
+ifneq ($(wildcard $(YAMLCPP)),)
+CXXFLAGS += -I$(YAMLCPP)/include
+LDFLAGS  += -L$(firstword $(wildcard $(YAMLCPP)/lib64 $(YAMLCPP)/lib))
+endif
 
 # Compile-time configuration flags (can be overridden on command line)
 # Example: make FAUNUS_BRANCH_FACTOR=128 KEY_SIZE=16
@@ -61,10 +69,10 @@ KV_TARGET = kv_test
 all: $(TARGET) $(KV_TARGET)
 
 $(TARGET): $(OBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $(OBJ) -lyaml-cpp
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJ) $(LDFLAGS)
 
 $(KV_TARGET): $(KV_OBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $(KV_OBJ) -lyaml-cpp
+	$(CXX) $(CXXFLAGS) -o $@ $(KV_OBJ) $(LDFLAGS)
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
