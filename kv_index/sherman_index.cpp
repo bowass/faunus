@@ -7,6 +7,8 @@ using namespace sherman_index_internal;
 
 thread_local GlobalAddress path_stack[kMaxLevelOfTree];
 
+std::atomic<uint32_t> next_32bit_id = 0;
+
 ShermanIndex::ShermanIndex(std::shared_ptr<RDMAManager> rdma_mgr,
                           std::shared_ptr<LocalAllocator> allocator,
                           GlobalAddress root_offset_pointer, 
@@ -16,7 +18,10 @@ ShermanIndex::ShermanIndex(std::shared_ptr<RDMAManager> rdma_mgr,
     
     // Get CS-level RDMA tag from LocalLockManager (shared by all threads on this CS)
     if (local_lock_mgr) {
-        cs_rdma_tag_ = local_lock_mgr->get_cs_rdma_tag();
+        uint32_t cs_id = local_lock_mgr->get_cs_rdma_tag();
+        uint32_t next_id = next_32bit_id.fetch_add(1, std::memory_order_relaxed);
+        cs_rdma_tag_ = ((uint64_t)cs_id << 32) | (uint64_t)next_id;
+
         LOG_DEBUG("ShermanIndex @" << static_cast<void*>(this) << " using shared CS RDMA tag=" << std::hex << cs_rdma_tag_ 
                   << std::dec << " from LocalLockManager @" << local_lock_mgr.get());
     } else {
@@ -78,7 +83,7 @@ bool ShermanIndex::try_lock_address(GlobalAddress lock_address) {
     bool is_handover = false;
     if (local_lock_mgr_) {
         // Acquire local lock - returns true if RDMA already held (handover)
-        is_handover = local_lock_mgr_->acquire(lock_address);
+        is_handover = local_lock_mgr_->acquire(lock_address); 
         
         // Track local lock acquisition
         if (stats_tracker_) {
@@ -113,7 +118,6 @@ bool ShermanIndex::try_lock_address(GlobalAddress lock_address) {
         assert(op_success && "RDMA operation should not fail");
         
         if (expected_val == 0) {
-            // LOG_DEBUG("[CS:" << tag << "] Acquired RDMA lock for addr=" << std::hex << lock_address.raw << std::dec << " after " << retry_cnt << " retries");
             return true;
         }
 
@@ -122,9 +126,8 @@ bool ShermanIndex::try_lock_address(GlobalAddress lock_address) {
         
         // Check if we already hold this lock (self-ownership detection)
         // This should NOT happen in correct code, but handle gracefully
-        if (current_value == tag) {
-            // LOG_DEBUG("Thread already holds lock at address " << std::hex << lock_address.raw 
-                    //  << " with tag " << std::hex << tag << " - returning success");
+        // This checks now if any previous CS thread has acquired it
+        if ((current_value >> 32) == (tag >> 32)) {
             return true;
         }
         
@@ -144,7 +147,7 @@ bool ShermanIndex::try_lock_address(GlobalAddress lock_address) {
             assert(false && "Deadlock detected in RDMA locking");
             return false;
         }
-        
+
         // Sherman's critical optimization: reset retry counter when lock holder changes
         // This ensures fairness and prevents starvation when lock holder changes
         if (current_value != pre_conflict_tag) {
@@ -156,12 +159,12 @@ bool ShermanIndex::try_lock_address(GlobalAddress lock_address) {
         assert(current_value != 0 && "Lock should not be 0 if CAS failed");
         // std::cout << std::this_thread::get_id() << " ... waiting lock=" << lock_address << std::endl;
         // util::precise_sleep_us(10);
+         if (retry_cnt % 100 == 0) std::this_thread::yield();
     }
 }
 
 void ShermanIndex::unlock_address(GlobalAddress lock_address) {
     // Use CS-level tag (shared by all threads on this compute server)
-    uint64_t tag = cs_rdma_tag_;
     
     if (local_lock_mgr_) {
         // Check if we should handover to next waiter on this CS
@@ -173,7 +176,6 @@ void ShermanIndex::unlock_address(GlobalAddress lock_address) {
             // RDMA lock stays held - don't release
         } else {
             // No handover: release RDMA lock
-            // LOG_DEBUG("[CS:" << tag << "] Releasing RDMA lock for addr=" << std::hex << lock_address.raw << std::dec);
             rdma_cas_release_lock(*rdma_mgr_, lock_address);
         }
     } else {
@@ -214,7 +216,6 @@ void ShermanIndex::write_page_and_unlock(void* page_buffer, GlobalAddress page_a
 bool ShermanIndex::search_node(GlobalAddress node_address, const Key& key, SearchResult& result, bool from_cache /*= false*/) {
     int counter = 0;
     LeafPage page;
-    GlobalAddress lock_address = node_address;
     
 re_read:
     if (++counter > 100) {
@@ -228,8 +229,6 @@ re_read:
         goto re_read;
     }
 
-    // TODO: debug
-    memset(&result, 0, sizeof(result));
     result.is_leaf = (page.hdr.leftmost_ptr == GlobalAddress::Null());
     result.level = page.hdr.level;
 
@@ -316,7 +315,6 @@ inline void ShermanIndex::before_operation() {
 }
 
 GlobalAddress ShermanIndex::get_leaf_from_cache_entry(const Entry<Key, ShermanCacheItem>& entry, const Key& key) {
-    GlobalAddress node_address = entry.item.first;
     InternalPage page = entry.item.second;
 
     if (entry.start > key || entry.end <= key) {
@@ -562,7 +560,7 @@ bool ShermanIndex::read(const Key& key, Value& value_out) {
     GlobalAddress root = get_root_offset();
     GlobalAddress p = root;
     bool from_cache = false;
-    Entry<Key, ShermanCacheItem>* cached_entry;
+    Entry<Key, ShermanCacheItem>* cached_entry = nullptr;
 
     // Try cache lookup first
     if (sherman_cache_) {

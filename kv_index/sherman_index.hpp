@@ -24,6 +24,7 @@ namespace sherman_index_internal {
     constexpr uint64_t kNumOfLock = kLockChipMemSize / sizeof(uint64_t);
 
     // Fingerprint: 12-bit hash of key for fast comparison
+    // Note: settings this as
     struct Fingerprint {
         uint16_t value : 12;
     
