@@ -22,6 +22,32 @@ struct Entry {
         : start(s), end(e), item(v) { skiplist_init_node(&node_); }
 };
 
+// for timestamp-based eviction
+inline uint64_t next_timestamp() noexcept {
+    // Compile-time constants (not global)
+    constexpr uint64_t LOCAL_BITS = 10;
+    constexpr uint64_t LOCAL_MASK = (1ULL << LOCAL_BITS) - 1;
+
+    // One atomic epoch shared across the program
+    static std::atomic<uint64_t> epoch{1};
+
+    // One TLS counter per thread
+    thread_local uint64_t local = 0;
+
+    uint64_t l = local++;
+
+    // Fast path: no rollover
+    if (l <= LOCAL_MASK) {
+        return (epoch.load(std::memory_order_relaxed) << LOCAL_BITS) | l;
+    }
+
+    // Slow path: rollover the local counter and bump epoch
+    local = 0;
+    uint64_t e = epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    return e << LOCAL_BITS;
+}
+
 template<typename KeyT, typename ItemT>
 class RangeCache {
 public:
@@ -169,33 +195,63 @@ private:
     }
 
     // ---------------- Eviction ----------------
-    EntryT* pick_victim_sample() {
-        skiplist_node* n = skiplist_begin(&list_);
-        if (!n || n == &list_.tail) return nullptr;
-        unsigned steps = tls_xorshift() % (sampling_steps_ + 1);
-        for (unsigned i = 0; i < steps && n && n != &list_.tail; ++i)
-            n = skiplist_next(&list_, n);
-        if (!n || n == &list_.tail) return nullptr;
-        return _get_entry(n, EntryT, node_);
+    inline EntryT* pick_victim_sample() {
+        uint32_t total = list_.num_entries;
+        if (total == 0)
+            return nullptr;
+
+        // 1) Pick global index
+        uint32_t r = tls_xorshift() % total;
+
+        // 2) Map index -> skiplist layer
+        uint32_t accum = 0;
+        int lvl = 0;
+
+        // Unrolled small loop – fast in hot cache
+        for (int L = 0; L <= list_.top_layer; ++L) {
+            accum += list_.layer_entries[L];
+            if (r < accum) {
+                lvl = L;
+                break;
+            }
+        }
+
+        // 3) Pick random node within chosen level
+        uint32_t idx = tls_xorshift() % list_.layer_entries[lvl];
+
+        skiplist_node* x = &list_.head;
+        while (idx-- && x->next[lvl] != &list_.tail)
+            x = x->next[lvl];
+
+        x = x->next[lvl];
+        if (!x || x == &list_.tail)
+            return nullptr;
+
+        return _get_entry(x, EntryT, node_);
     }
 
     void evict_power_of_two() {
         if (entrySlab_->free_count() > 0) return;
-        size_t count = maxEntries_ & (maxEntries_ - 1);
-        if (count == 0) count = 1;
-        for (size_t i = 0; i < count; ++i) {
-            EntryT* victim = pick_victim_sample();
-            if (!victim) break;
-            if (skiplist_erase_node(&list_, &victim->node_) != 0) continue;
-            retire_entry(reinterpret_cast<int64_t>(victim));
-        }
+        EntryT* v1 = pick_victim_sample();
+        if (!v1) return;
+        EntryT* v2 = pick_victim_sample();
+        if (!v2) return;
+
+        uint64_t a1 = v1->lastAccess.load(std::memory_order_relaxed);
+        uint64_t a2 = v2->lastAccess.load(std::memory_order_relaxed);
+
+        EntryT* victim = (a1 < a2) ? v1 : v2;
+        // std::cout << "Eviction: " << a1 << " vs " << a2 << std::endl;
+
+        if (skiplist_erase_node(&list_, &victim->node_) != 0) return;
+        retire_entry(reinterpret_cast<int64_t>(victim));
     }
 
     // ---------------- Access ----------------
     void updateAccess(EntryT* e) {
         uint64_t c = tls_local_access_counter_++;
         if ((c & (accessUpdateInterval_ - 1)) == 0)
-            e->lastAccess.store(c, std::memory_order_relaxed);
+            e->lastAccess.store(next_timestamp(), std::memory_order_relaxed);
     }
 
     // ---------------- Compare ----------------
