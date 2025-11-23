@@ -6,6 +6,7 @@
 #include <cassert>
 #include "../rdma/global_address.hpp"
 #include "../util/thread_logging.hpp"
+#include "../externals/concurrentqueue/concurrentqueue.h"
 
 namespace local_locks {
 
@@ -30,31 +31,23 @@ struct HandoverFlag {
  * - handover_flags: Per-ticket handover communication (circular buffer)
  */
 struct LocalLockNode {
-    std::atomic<uint64_t> ticket_lock{0};     // Lower 32: next ticket, Upper 32: current serving
-    std::atomic<uint8_t> handover_count{0};   // Consecutive handovers (reset on break)
-    
-    // Per-waiter handover flags (circular buffer indexed by ticket % buffer size)
-    static constexpr size_t kHandoverFlagSlots = 256;  // Support up to 256 concurrent waiters
+    std::atomic<uint64_t> ticket_lock{0};
+    std::atomic<uint8_t> handover_count{0};
+    static constexpr size_t kHandoverFlagSlots = 1024;
     HandoverFlag handover_flags[kHandoverFlagSlots];
 };
 
-/**
- * @brief Sherman-style local lock manager using fixed arrays and ticket locks
- */
 class LocalLockManager {
 private:
-    // Fixed array of lock nodes (Sherman style) - indexed by lock address
     std::unique_ptr<LocalLockNode[]> local_locks_;
-    uint64_t cs_rdma_tag_;  // Shared RDMA tag for all users of this LocalLockManager
+    uint64_t cs_rdma_tag_;  // Shared RDMA tag
 
-    // Convert GlobalAddress to lock index (Sherman's method)
     inline size_t get_lock_index(GlobalAddress addr) const {
-        return (addr.server_index() * kNumOfLock + (addr.offset() % kNumOfLock));
+        return addr.server_index() * kNumOfLock + (addr.offset() % kNumOfLock);
     }
 
 public:
     LocalLockManager(size_t num_ms) : local_locks_(new LocalLockNode[num_ms * kNumOfLock]) {
-        // Initialize all lock nodes
         for (size_t ms = 0; ms < num_ms; ++ms) {
             for (size_t i = 0; i < kNumOfLock; ++i) {
                 auto &node = local_locks_[ms * kNumOfLock + i];
@@ -65,112 +58,81 @@ public:
                 }
             }
         }
-        
-        // Generate CS-level RDMA tag (shared by all threads using this LocalLockManager)
-        // Use our own pointer address as unique CS identifier
+
         std::hash<void*> hasher;
         uint64_t hash_val = hasher(static_cast<void*>(this));
         cs_rdma_tag_ = (hash_val & 0xFFFFFFFFFFFFFFFFULL);
-        if (cs_rdma_tag_ == 0) {
-            cs_rdma_tag_ = 1;
-        }
-        
-        LOG_DEBUG("LocalLockManager initialized with CS RDMA tag=" << std::hex << cs_rdma_tag_ << std::dec);
+        if (cs_rdma_tag_ == 0) cs_rdma_tag_ = 1;
     }
 
-    ~LocalLockManager() = default;
-    
-    // Get the shared RDMA tag for this compute server
     uint64_t get_cs_rdma_tag() const { return cs_rdma_tag_; }
 
-    /**
-     * @brief Acquire local lock for intra-CS serialization
-     * @return true if RDMA lock was handed over (skip RDMA acquire), false otherwise
-     * 
-     * Protocol (like HOCL):
-     * 1. Get ticket and wait for local lock
-     * 2. Check our per-waiter handover flag
-     * 3. Clear our flag for next time
-     * 4. Return true if handed over (caller skips RDMA), false if need RDMA acquire
-     */
+    // Acquire local lock. Return true if handed-over (skip RDMA)
     bool acquire(GlobalAddress addr) {
-        size_t lock_idx = get_lock_index(addr);
-        auto &node = local_locks_[lock_idx];
+        size_t idx = get_lock_index(addr);
+        auto &node = local_locks_[idx];
 
-        // Get ticket for local lock
-        uint64_t lock_val = node.ticket_lock.fetch_add(1);
+        uint64_t lock_val = node.ticket_lock.fetch_add(1, std::memory_order_acquire);
         uint32_t my_ticket = static_cast<uint32_t>(lock_val & 0xFFFFFFFFu);
-        uint32_t current_serving = static_cast<uint32_t>((lock_val >> 32) & 0xFFFFFFFFu);
-        
-        // Wait for our turn
-        while (my_ticket != current_serving) {
+
+        while (true) {
+            uint32_t current_serving = static_cast<uint32_t>(node.ticket_lock.load(std::memory_order_acquire) >> 32);
+            if (my_ticket == current_serving) break;
             std::this_thread::yield();
-            current_serving = node.ticket_lock.load(std::memory_order_acquire) >> 32;
         }
 
-        // We now hold the local lock
-        // Check OUR specific handover flag (set by previous holder if they handed over to us)
-        size_t my_flag_idx = my_ticket % LocalLockNode::kHandoverFlagSlots;
-        bool was_handed_over = node.handover_flags[my_flag_idx].handed_over.load(std::memory_order_acquire);
-        
-        // Clear flag for next time this slot is used
-        if (was_handed_over) {
-            node.handover_flags[my_flag_idx].handed_over.store(false, std::memory_order_relaxed);
-        }
-        
+        // Detect handover from previous owner
+        size_t slot = my_ticket % LocalLockNode::kHandoverFlagSlots;
+        bool was_handed_over = node.handover_flags[slot].handed_over.load(std::memory_order_acquire);
+        node.handover_flags[slot].handed_over.store(false, std::memory_order_release);
+
         return was_handed_over;
     }
 
-    /**
-     * @brief Release local lock with optional handover
-     * @return true if handover (keep RDMA lock), false if should release RDMA
-     * 
-     * Protocol (like HOCL):
-     * 1. Check if another thread is waiting on local lock
-     * 2. If yes and under handover limit: set next waiter's flag, handover
-     * 3. If no waiters or limit reached: break chain
-     * 4. Release local lock
-     * 
-     * On handover: Next waiter's flag is set BEFORE we release local lock (no race!)
-     * On break: Caller releases RDMA lock
-     */
+    // Release local lock. Return true if handover (keep RDMA lock)
     bool release(GlobalAddress addr) {
-        size_t lock_idx = get_lock_index(addr);
-        auto &node = local_locks_[lock_idx];
+        size_t idx = get_lock_index(addr);
+        auto &node = local_locks_[idx];
 
-        // Check if we should handover
         uint64_t lock_val = node.ticket_lock.load(std::memory_order_acquire);
-        uint32_t current_serving = static_cast<uint32_t>((lock_val >> 32) & 0xFFFFFFFFu);
+        uint32_t current_serving = static_cast<uint32_t>(lock_val >> 32);
         uint32_t next_ticket = static_cast<uint32_t>(lock_val & 0xFFFFFFFFu);
-        uint8_t handovers = node.handover_count.load(std::memory_order_acquire);
 
-        // Check if someone is waiting:
-        // - current_serving = us (the holder)
-        // - next_ticket = next to be issued
-        // - Next waiter has ticket current_serving+1
-        // - So waiter exists if next_ticket > current_serving+1
-        bool has_waiter = (next_ticket > current_serving + 1);
-        bool under_limit = (handovers < kMaxHandOverTime);
-        bool should_handover = has_waiter && under_limit;
+        uint32_t waiters = next_ticket - current_serving - 1;
 
-        if (should_handover) {
-            // Handover: set next waiter's flag BEFORE releasing local lock
-            uint32_t next_waiter_ticket = current_serving + 1;
-            size_t next_flag_idx = next_waiter_ticket % LocalLockNode::kHandoverFlagSlots;
-            node.handover_flags[next_flag_idx].handed_over.store(true, std::memory_order_release);
-            
-            // Increment handover counter
+        if (waiters > 0 && node.handover_count.load(std::memory_order_acquire) < kMaxHandOverTime) {
+            // Handover: mark next ticket as handed-over
+            size_t next_slot = (current_serving + 1) % LocalLockNode::kHandoverFlagSlots;
+            node.handover_flags[next_slot].handed_over.store(true, std::memory_order_release);
+
             node.handover_count.fetch_add(1, std::memory_order_release);
+
+            // Advance serving to let next thread proceed
+            node.ticket_lock.fetch_add(1ULL << 32, std::memory_order_release);
+
+            return true;  // keep RDMA lock
         } else {
-            // Break chain: reset handover counter
+            // No handover: reset handover_count
             node.handover_count.store(0, std::memory_order_release);
+            node.ticket_lock.fetch_add(1ULL << 32, std::memory_order_release);
+
+            return false;  // caller must release RDMA
         }
+    }
 
-        // Always release local lock (advance serving ticket)
-        node.ticket_lock.fetch_add(1ULL << 32, std::memory_order_release);
+    // Optional helper for checking handover without releasing
+    bool can_hand_over(GlobalAddress addr) const {
+        size_t idx = get_lock_index(addr);
+        auto &node = local_locks_[idx];
 
-        return should_handover;
+        uint64_t lock_val = node.ticket_lock.load(std::memory_order_acquire);
+        uint32_t current_serving = static_cast<uint32_t>(lock_val >> 32);
+        uint32_t next_ticket = static_cast<uint32_t>(lock_val & 0xFFFFFFFFu);
+        uint32_t waiters = next_ticket - current_serving - 1;
+
+        return waiters > 0 && node.handover_count.load(std::memory_order_acquire) < kMaxHandOverTime;
     }
 };
+
 
 } // namespace local_locks
