@@ -331,14 +331,20 @@ int main(int argc, char* argv[]) {
             };
 
             // Warm-up using PUT operations with global key space distribution
+            Key warmup_key = Key::min();
+            warmup_key += 1;
+            {
+                std::random_device tmp_rd;
+                std::mt19937 tmp_gen(tmp_rd());
+                std::uniform_int_distribution<> tmp_dis(0, 255);
+                warmup_key.data()[0] = cs_id;
+                warmup_key.data()[1] = tmp_dis(tmp_gen);
+            }
+
             for (size_t i = 0; i < warmup_per_client; ++i) {
-                Key key = sample_global_key();  // Use global key space
                 Value value = util::generate_random_value(value_rng);
-                bool inserted = perform_put(key, value);
-                if (!inserted) {
-                    // Stop warmup if PUT fails consistently (very unlikely with insert-or-update)
-                    break;
-                }
+                bool inserted = perform_put(warmup_key, value);
+                warmup_key += 1;
             }
 
             // reset stats
@@ -353,7 +359,6 @@ int main(int argc, char* argv[]) {
                 if (count == total_clients) {
                     // Last thread to arrive - notify all waiting threads
                     // enables RDMAManager sleep
-                    std::cout << "Warmup is done!" << std::endl;
                     rdma_mgr->set_sleep(true);
                     warmup_cv.notify_all();
                     benchmark_start = std::chrono::steady_clock::now();
