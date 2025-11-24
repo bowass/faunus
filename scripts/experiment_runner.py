@@ -286,7 +286,7 @@ class ExperimentRunner:
                 for attempt in range(max_failing_attempts):
                     print(f"    Attempt {attempt}/{max_failing_attempts}")
                     secs_to_sleep = 10
-                    print(f"Sleeping for {secs_to_sleep}s")
+                    print(f"    Sleeping for {secs_to_sleep}s")
                     time.sleep(secs_to_sleep)
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
                     

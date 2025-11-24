@@ -113,6 +113,14 @@ def generate_plots(output_cfg: Dict[str, Any], results: List[Dict], output_dir: 
     groups = _group_data(results, series_by)
     
     for group_key, group_results in groups.items():
+        # dump structure json for later (tex plot)
+        figure_json = dump_output_structure(output_cfg, results)
+        
+        output_json_path = Path(output_dir) / f"{plot_name}_{'_'.join(str(v) for v in group_key)}_structure.json"
+        print(f"Dumping to {output_json_path}")
+        with open(output_json_path, 'w') as f:
+            json.dump(figure_json, f, indent=4)
+
         if group_key:
             group_suffix = '_'.join(f"{v}" for v in group_key)
             filename = f"{plot_name}_{group_suffix}.png"
@@ -360,3 +368,254 @@ def _plot_metric(ax, results, x_values, y_cfg, annotate, cdf_ranges=None):
         if annotate:
             for x, y in zip(x_values, y_values):
                 ax.text(x, y, f'{y:.1f}', ha='center', va='bottom', fontsize=8)
+
+import json
+
+def dump_output_structure(output_cfg, results):
+    """
+    Build a full semantic dump of the plot configuration and the resolved
+    X/Y series exactly as drawn by matplotlib, so it can be exported to TikZ.
+    """
+    figure = {
+        "version": "1.0",
+        "figure": {
+            "name": output_cfg.get("name", "plot"),
+            "title": output_cfg.get("title", ""),
+            "subplots": []
+        }
+    }
+
+    series_by = output_cfg.get('series_by', [])
+    x_axis_cfg = output_cfg.get("x_axis", {})
+    y_axes_cfg = output_cfg.get("y_axes", [])
+    cdf_ranges = output_cfg.get("cdf_ranges", None)
+
+    groups = _group_data(results, series_by)
+
+    # One subplot per group
+    for group_key, group_results in groups.items():
+
+        # -------------------------------------------------------------
+        # Resolve X-axis values (numeric, categorical, cdf) EXACTLY
+        # as the plotting code uses them.
+        # -------------------------------------------------------------
+        x_metric = x_axis_cfg.get("metric")
+        has_cdf = any(y.get("plot_type") == "cdf" for y in y_axes_cfg)
+
+        if has_cdf:
+            # CDF plots do not use x-axis from parameters
+            x_axis_type = "numeric"
+            x_values = None
+            categories = None
+
+        elif x_metric is None:
+            # CATEGORICAL AXIS
+            x_axis_type = "categorical"
+            names = [r["name"] for r in group_results]
+            categories = remove_common_affix(names)
+            x_values = list(range(len(categories)))
+
+        else:
+            # NUMERIC AXIS
+            x_axis_type = "numeric"
+            raw_x = [
+                _get_nested(r["parameters"], x_metric,
+                            _get_nested(r["metrics"], x_metric))
+                for r in group_results
+            ]
+            # sort according to plotting order
+            sorted_pairs = sorted(zip(raw_x, group_results), key=lambda p: p[0])
+            x_values, group_results = zip(*sorted_pairs)
+            x_values = list(x_values)
+            categories = None
+
+        subplot = {
+            "id": "subplot_0" if not group_key else f"subplot_{'_'.join(map(str, group_key))}",
+            "title": output_cfg.get("title", ""),
+            "metadata": {
+                "group_key": list(group_key),
+                "group_by": series_by
+            },
+            "x_axis": {
+                "type": x_axis_type,
+                "label": x_axis_cfg.get("label", "X"),
+                "values": x_values,
+                "categories": categories,
+                "tick_labels": categories if categories else []
+            },
+            "y_axes": [],
+            "legend": {"entries": [], "position": "north east"},
+            "grid": {"enabled": True},
+        }
+
+        # -------------------------------------------------------------
+        # Handle each axis (left/right)
+        # -------------------------------------------------------------
+        for axis_side in ["left", "right"]:
+            axis_cfgs = [y for y in y_axes_cfg if y.get("axis", "left") == axis_side]
+            if not axis_cfgs:
+                continue
+
+            axis_block = {
+                "axis_id": axis_side,
+                "label": axis_cfgs[0].get("label", ""),
+                "series": []
+            }
+
+            # For each metric displayed on this axis
+            for y_cfg in axis_cfgs:
+                metric = y_cfg["metric"]
+                plot_type = y_cfg.get("plot_type", "line")
+
+                for idx, result in enumerate(group_results):
+                    series = {
+                        "name": y_cfg.get("metric_label", metric),
+                        "plot_type": plot_type,
+                        "x": [],
+                        "y": [],
+                        "annotations": []
+                    }
+
+                    if plot_type == "cdf":
+                        # Resolve histogram → CDF curve
+                        hist = _get_nested(result["metrics"], metric, [])
+                        x_cdf, y_cdf = _extract_cdf_from_histogram(hist)
+
+                        # Apply global CDF ranges if present
+                        if cdf_ranges:
+                            mask = []
+                            for i, xval in enumerate(x_cdf):
+                                for rng in cdf_ranges:
+                                    if rng["x_min"] <= xval <= rng["x_max"]:
+                                        mask.append(i)
+                            x_cdf = [x_cdf[i] for i in mask]
+                            y_cdf = [y_cdf[i] for i in mask]
+
+                        series["x"] = x_cdf
+                        series["y"] = y_cdf
+
+                    else:
+                        # Normal metric
+                        x_list = subplot["x_axis"]["values"]
+                        y_list = [
+                            _get_nested(result["metrics"], metric)
+                        ]
+                        # repeat x_list if scalar?
+                        if len(x_list) == 1 and len(y_list) == 1:
+                            series["x"] = x_list
+                            series["y"] = y_list
+                        else:
+                            # numeric x-axis already sorted earlier
+                            series["x"] = [x_list[idx]]
+                            series["y"] = [ _get_nested(result["metrics"], metric) ]
+
+                    axis_block["series"].append(series)
+                    subplot["legend"]["entries"].append(series["name"])
+
+            subplot["y_axes"].append(axis_block)
+
+        figure["figure"]["subplots"].append(subplot)
+
+    return figure
+
+import textwrap
+from typing import Dict, List
+
+
+def json_to_tikz(fig: Dict) -> str:
+    """Convert structured plot JSON into TikZ/PGFPlots code."""
+
+    def esc(s: str) -> str:
+        return s.replace('_', '\\_')
+
+    tikz = []
+    tikz.append("\\begin{figure}[htbp]")
+    tikz.append("\\centering")
+    tikz.append("\\begin{tikzpicture}")
+
+    for subplot in fig["figure"]["subplots"]:
+        title = esc(subplot["title"])
+
+        # -----------------------------------------------------
+        #  Create primary LEFT axis
+        # -----------------------------------------------------
+        left_axis = next((ax for ax in subplot["y_axes"] if ax["axis_id"] == "left"), None)
+        right_axis = next((ax for ax in subplot["y_axes"] if ax["axis_id"] == "right"), None)
+
+        xax = subplot["x_axis"]
+
+        tikz.append(f"  % Subplot: {title}")
+        tikz.append("  \\begin{axis}[")
+
+        # X-axis configuration
+        if xax["type"] == "categorical":
+            tikz.append(f"    symbolic x coords={{{{ {','.join(map(esc, xax['categories']))} }}}},")
+            tikz.append("    xtick=data,")
+        else:
+            tikz.append(f"    xtick={{{{{ {','.join(map(str, xax['values']))} }}}}},")
+
+        tikz.append(f"    xlabel={{{{{ {esc(xax['label'])} }}}}},")
+        tikz.append(f"    ylabel={{{{{ {esc(left_axis['label']) if left_axis else ''} }}}}},")
+
+        if subplot.get("grid", {}).get("enabled", False):
+            tikz.append("    grid=both,")
+
+        tikz.append("  ]")
+
+        # -----------------------------------------------------
+        #  Left axis series
+        # -----------------------------------------------------
+        if left_axis:
+            for s in left_axis["series"]:
+                plot_type = s["plot_type"]
+                name = esc(s["name"])
+
+                if plot_type == "line":
+                    style = "mark=o, thick"
+                elif plot_type == "bar":
+                    style = "ybar, thick"
+                elif plot_type == "cdf":
+                    style = "const plot, mark=none, thick"
+                else:
+                    style = "thick"
+
+                tikz.append(f"    \\addplot[{style}] coordinates {{")
+                for x, y in zip(s["x"], s["y"]):
+                    tikz.append(f"      ({esc(str(x))},{y})")
+                tikz.append("    };")
+                tikz.append(f"    \\addlegendentry{{{name}}}")
+
+        tikz.append("  \\end{axis}")
+
+        # -----------------------------------------------------
+        #  Right axis (if exists)
+        # -----------------------------------------------------
+        if right_axis:
+            tikz.append("  \\begin{axis}[")
+            tikz.append("    axis y line*=right,")
+            tikz.append("    axis x line=none,")
+            tikz.append(f"    ylabel={{{{{ {esc(right_axis['label'])} }}}}},")
+            tikz.append("  ]")
+
+            for s in right_axis["series"]:
+                name = esc(s["name"])
+                plot_type = s["plot_type"]
+
+                if plot_type == "cdf":
+                    style = "const plot, mark=none, densely dashed, thick"
+                else:
+                    style = "thick, dashed"
+
+                tikz.append(f"    \\addplot[{style}] coordinates {{")
+                for x, y in zip(s["x"], s["y"]):
+                    tikz.append(f"      ({esc(str(x))},{y})")
+                tikz.append("    };")
+                tikz.append(f"    \\addlegendentry{{{name}}}")
+
+            tikz.append("  \\end{axis}")
+
+    tikz.append("\\end{tikzpicture}")
+    tikz.append("\\caption{" + esc(fig['figure']['title']) + "}")
+    tikz.append("\\end{figure}")
+
+    return "\n".join(tikz)
