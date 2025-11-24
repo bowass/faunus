@@ -938,6 +938,13 @@ bool FaunusIndex::setup_new_root(const Key& key, GlobalAddress right_child, size
     return true;
 }
 
+uint64_t hash_int(uint64_t x) {
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    x = x ^ (x >> 31);
+    return x;
+}
+
 bool FaunusIndex::request_smo(FaunusMaintenanceRPC::OpType op, GlobalAddress leaf_address) {
 #ifdef FAUNUS_MAINTENANCE_ENABLED
     // Prefer queued-sets if available (prevents duplicates)
@@ -960,7 +967,7 @@ bool FaunusIndex::request_smo(FaunusMaintenanceRPC::OpType op, GlobalAddress lea
     // Fallback to regular maintenance queues (legacy behavior)
     size_t num_queues = num_maintenance_queues();
     if (num_queues == 0) return std::cout << "got num_queues 0" << std::endl, false;
-    size_t queue_idx = std::hash<uint64_t>{}(leaf_address.raw) % num_queues;
+    size_t queue_idx = hash_int(leaf_address.raw) % num_queues;
     auto queue = get_maintenance_queue(queue_idx);
     if (!queue) {
         return std::cout << "got null queue" << std::endl, false;
