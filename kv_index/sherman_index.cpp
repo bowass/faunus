@@ -1,8 +1,6 @@
 #include "sherman_index.hpp"
 #include <thread>
 
-#include "../util/precise_sleep.hpp"
-
 using namespace sherman_index_internal;
 
 thread_local GlobalAddress path_stack[kMaxLevelOfTree];
@@ -130,7 +128,6 @@ bool ShermanIndex::try_lock_address(GlobalAddress lock_address) {
         if ((current_value >> 32) == (tag >> 32)) {
             return true;
         }
-        
         // Check retry limit AFTER self-ownership check
         if (retry_cnt > 1000000) {
             std::cout << "DEADLOCK: retry=" << retry_cnt 
@@ -157,8 +154,6 @@ bool ShermanIndex::try_lock_address(GlobalAddress lock_address) {
         
         // Validate the conflict tag
         assert(current_value != 0 && "Lock should not be 0 if CAS failed");
-        // std::cout << std::this_thread::get_id() << " ... waiting lock=" << lock_address << std::endl;
-        // util::precise_sleep_us(10);
          if (retry_cnt % 100 == 0) std::this_thread::yield();
     }
 }
@@ -590,7 +585,6 @@ next:
             p = root;
         }
         else {
-            // should be shit
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         goto next;
@@ -745,11 +739,6 @@ next:
         return;
     }
     assert(result.level != 0);
-    // if (result.level == 0) {
-    //     std::this_thread::sleep_for(std::chrono::seconds(reinterpret_cast<uint64_t>(&result) % 7));
-    //     std::cout << result.val << " " << p << " " << result.is_leaf << " " << result.next_level << " " << result.slibing << std::endl;
-    //     assert(0);
-    // }
     if (result.slibing != GlobalAddress::Null()) {
         p = result.slibing;
         goto next;
