@@ -13,7 +13,7 @@ namespace local_locks {
 // Sherman's constants
 constexpr uint64_t kLockChipMemSize = 256 * 1024;
 constexpr uint64_t kNumOfLock = kLockChipMemSize / sizeof(uint64_t);
-constexpr uint8_t kMaxHandOverTime = 0;  // DISABLED to test if handovers cause deadlock
+constexpr uint8_t kMaxHandOverTime = 8;
 
 /**
  * @brief Per-waiter handover flag (like HOCL's wait queue entry)
