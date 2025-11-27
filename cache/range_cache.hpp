@@ -24,14 +24,11 @@ struct Entry {
 
 // for timestamp-based eviction
 inline uint64_t next_timestamp() noexcept {
-    // Compile-time constants (not global)
     constexpr uint64_t LOCAL_BITS = 10;
     constexpr uint64_t LOCAL_MASK = (1ULL << LOCAL_BITS) - 1;
 
-    // One atomic epoch shared across the program
     static std::atomic<uint64_t> epoch{1};
 
-    // One TLS counter per thread
     thread_local uint64_t local = 0;
 
     uint64_t l = local++;
@@ -77,8 +74,6 @@ public:
         while (retired_q_.try_dequeue(ri))
             freeEntryToSlabOffset(ri.offset);
     }
-
-    // ---------------- Public API ----------------
 
     EntryT* search(const KeyT& key) {
         ThreadGuard guard(this);
@@ -241,7 +236,6 @@ private:
         uint64_t a2 = v2->lastAccess.load(std::memory_order_relaxed);
 
         EntryT* victim = (a1 < a2) ? v1 : v2;
-        // std::cout << "Eviction: " << a1 << " vs " << a2 << std::endl;
 
         if (skiplist_erase_node(&list_, &victim->node_) != 0) return;
         retire_entry(reinterpret_cast<int64_t>(victim));

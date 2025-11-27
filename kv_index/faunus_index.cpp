@@ -37,7 +37,6 @@ FaunusIndex::FaunusIndex(std::shared_ptr<RDMAManager> rdma_mgr,
 
 std::shared_ptr<IndexCacheBase> FaunusIndex::create_cache(size_t cache_size_bytes) const {
     // Estimate number of entries based on cache size
-    // Each InternalNode + overhead is roughly 1KB-2KB, so use conservative estimate
     size_t estimated_entries = std::max(size_t(1), cache_size_bytes / 2048);
     auto faunus_cache = std::make_shared<FaunusCache>(estimated_entries);
     return std::make_shared<FaunusCacheWrapper>(faunus_cache);
@@ -59,7 +58,6 @@ bool FaunusIndex::initialize(size_t num_maintenance_queues) {
 
     // initialize maintenance
     if (num_maintenance_queues > 0) {
-        // set_maintenance_queued_sets(create_maintenance_queued_sets(num_maintenance_queues));
         FaunusIndex::set_maintenance_queues(FaunusIndex::create_maintenance_queues(num_maintenance_queues));
     }
     return success;
@@ -162,8 +160,7 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
             use_cached_node = false; // Only use cache on first iteration
         } else {
             rdma_read_object(*rdma_mgr_, node_address, node);
-            // Add to cache if it's at the target cache level (one level above leaves)
-            // TODO: change 1 to configurable target level
+            // Add to cache if it's at the target cache level (one level above leaves, or 2 if SMO)
             if (faunus_cache_ && !node.header.lock && (node.header.level == uint64_t(1 + from_smo))) {
                 faunus_cache_->add(node.header.fence.first, node.header.fence.second, {node_address, node});
             }
@@ -171,7 +168,6 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
 
         // if locked and not from smo, or another smo has locked an ancestor
         // TODO: even if from_smo, we should not process if the node is locked
-        // if (node.header.lock && (!from_smo || node.header.level > level)) {
         if (node.header.lock && (!from_smo || node.header.level > level)) {
             if (got_from_cache) {
                 faunus_cache_->invalidate(cached_entry);
@@ -197,7 +193,6 @@ FindNodeResult FaunusIndex::find_node(const Key& key, GlobalAddress& node_addres
         }
 
         // find next level
-        // TODO: binary search
         bool found = false;
         GlobalAddress next_address;
         for (size_t i = 0; !found && (i <= node.header.last_index); i++) {
