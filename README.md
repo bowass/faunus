@@ -98,3 +98,19 @@ This project includes third-party code:
 ---
 
 **Disclaimer**: This is research software intended for experimental evaluation. It is not recommended for production use. No warranties are provided regarding correctness, performance, or suitability for any particular purpose. Users assume all risks and responsibilities when using this software.
+
+requirements:
+gcc>=12.2.0
+yaml-cpp
+
+add a comment - __attribute__((packed)) MUST not be set in Sherman Fingerprint - this fucks up things
+
+`srun -p arm -n1 -c80 --mem=80g --pty bash`
+
+spack load py-pyaml
+spack load py-matplotlib
+spack load py-numpy
+
+remove core binding support?
+
+add latency in watermark+branch factor experiment?
