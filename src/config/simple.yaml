@@ -6,14 +6,9 @@ base_rtt_ns: 300
 initial_slabs_per_size: 32768
 maintenance_cs: 1
 threads_per_maintenance_cs: 1
-log_level: DEBUG
-# log_level: DEBUG
+log_level: INFO
 ops_per_client: 100000
 warmup_inserts: 100000
-# CPU core binding configuration
-cpu_binding_enabled: false
-cpu_binding_start_core: 0
-cpu_isolation_required: false
 distribution:
   type: skewed
   key_space: 2000000
@@ -21,4 +16,4 @@ preset: write-only
 cache:
   enabled: true
   max_size_kb: 65536
-index: "sherman"
+index: "faunus"

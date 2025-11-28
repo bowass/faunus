@@ -36,7 +36,7 @@ make kv_test KEY_SIZE=16 VALUE_SIZE=128 FAUNUS_MAINTENANCE_ENABLED=1
 
 **Basic usage:**
 ```bash
-./kv_test config/simple_faunus.yaml
+./kv_test config/simple.yaml
 ```
 Results are written to `thread_stats/` as JSON files.
 
