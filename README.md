@@ -1,4 +1,4 @@
-# Faunus: Lock-Free Distributed B+Tree for RDMA Disaggregated Memory
+# Faunus: An IDU Lock-Free Distributed B+Tree for RDMA-based Disaggregated Memory
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
