@@ -8,7 +8,7 @@ A research-oriented C++17 simulator for evaluating B+Tree indices optimized for 
 
 **Simulation Platform:** Faunus provides a high-fidelity RDMA simulation layer modeling one-sided operations (READ, WRITE, CAS, FAA) with realistic latency characteristics, enabling rapid prototyping and controlled experimental evaluation without physical hardware dependencies. The simulator enforces network round-trip times and supports batched operations to accurately reflect disaggregated memory performance.
 
-**Faunus Design:** Faunus is an optimized B+Tree that minimizes network round-trips through aggressive operation batching, employs optimistic concurrency control via RDMA CAS primitives, and supports optional client-side caching and asynchronous background maintenance. The index is designed ground-up for remote memory access patterns, prioritizing RTT reduction over CPU efficiency.
+**Faunus Design:** Faunus is an optimized B+Tree that minimizes network round-trips through an aggressive lock-free approach, while utilizing operation batching, and supports optional client-side caching and asynchronous background maintenance. The index is designed ground-up for remote memory access patterns, prioritizing RTT reduction over CPU efficiency.
 
 **Baseline:** We implement the [Sherman](https://github.com/thustorage/Sherman) B+Tree design in our simulation platform to serve as a baseline for comparison, following their RDMA-based distributed index approach.
 
@@ -17,13 +17,6 @@ A research-oriented C++17 simulator for evaluating B+Tree indices optimized for 
 - **Compiler**: GCC 7+ or Clang 6+ with C++17 support
 - **Dependencies**: `yaml-cpp`, `make`
 - **Optional**: Python 3 with `matplotlib`, `numpy`, `pyyaml` for experiment automation
-
-**Installation (Ubuntu/Debian):**
-```bash
-sudo apt-get update
-sudo apt-get install build-essential libyaml-cpp-dev
-pip3 install matplotlib numpy pyyaml  # Optional, for plotting
-```
 
 ## Building
 
@@ -38,13 +31,6 @@ Compile-time parameters can be set via environment variables:
 ```bash
 make kv_test KEY_SIZE=16 VALUE_SIZE=128 FAUNUS_MAINTENANCE_ENABLED=1
 ```
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `KEY_SIZE` | 8 | Key size in bytes |
-| `VALUE_SIZE` | 8 | Value size in bytes |
-| `FAUNUS_BRANCH_FACTOR` | 64 | B+Tree fanout |
-| `FAUNUS_MAINTENANCE_ENABLED` | 0 | Enable async maintenance |
 
 ## Running
 
@@ -83,15 +69,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.**
-
-### Third-Party Licenses
-
-This project includes third-party code:
-
-- **Sherman** (`externals/sherman/`): Baseline B+Tree implementation based on [Sherman](https://github.com/thustorage/Sherman). See original repository for license details.
-- **ConcurrentQueue** (`externals/concurrentqueue/`): Lock-free queue by [moodycamel](https://github.com/cameron314/concurrentqueue). See `externals/concurrentqueue/LICENSE.md` for details.
-- **SkipList** (`externals/skiplist/`): Cache implementation. See `externals/skiplist/LICENSE` for details.
-- **yaml-cpp**: YAML parsing library (system package). Licensed under MIT.
 
 ---
 
