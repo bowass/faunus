@@ -3,14 +3,14 @@
 Comprehensive Experiment Runner
 
 This script executes complete experiment workflows based on configuration files:
-1. Runs all experiments defined in experiments.yaml
+1. Runs all experiments defined in experiments/experiments.yaml
 2. Collects results and generates CSV files
 3. Creates TikZ plots for publication
 
 Usage:
-    python3 experiment_runner.py --config experiments.yaml
-    python3 experiment_runner.py --config experiments.yaml --skip-graphs
-    python3 experiment_runner.py --config experiments.yaml --output-dir custom_results/
+    python3 experiment_runner.py --config experiments/experiments.yaml
+    python3 experiment_runner.py --config experiments/experiments.yaml --skip-graphs
+    python3 experiment_runner.py --config experiments/experiments.yaml --output-dir custom_results/
 """
 
 import sys
@@ -28,7 +28,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 import statistics
 
-from plotting_module import generate_plots
+from plotter import generate_plots
 
 
 @dataclass

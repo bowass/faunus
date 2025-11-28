@@ -10,12 +10,12 @@ A research-oriented C++17 simulator for evaluating B+Tree indices optimized for 
 
 **Faunus Design:** Faunus is an optimized B+Tree that minimizes network round-trips through aggressive operation batching, employs optimistic concurrency control via RDMA CAS primitives, and supports optional client-side caching and asynchronous background maintenance. The index is designed ground-up for remote memory access patterns, prioritizing RTT reduction over CPU efficiency.
 
-**Baseline:** We implement the [Sherman](https://github.com/thustorage/Sherman) B+Tree design in our simulation platform to serve as a baseline for comparison, following their RDMA-based distributed index approach
+**Baseline:** We implement the [Sherman](https://github.com/thustorage/Sherman) B+Tree design in our simulation platform to serve as a baseline for comparison, following their RDMA-based distributed index approach.
 
 ## System Requirements
 
 - **Compiler**: GCC 7+ or Clang 6+ with C++17 support
-- **Dependencies**: `libyaml-cpp-dev`, `make`
+- **Dependencies**: `yaml-cpp`, `make`
 - **Optional**: Python 3 with `matplotlib`, `numpy`, `pyyaml` for experiment automation
 
 **Installation (Ubuntu/Debian):**
@@ -56,11 +56,9 @@ Results are written to `thread_stats/` as JSON files.
 
 **Experiment automation:**
 ```bash
-python3 scripts/experiment_runner.py --config experiments_evaluation.yaml
-python3 scripts/experiment_runner.py --config experiments_evaluation.yaml --plot-only
+python3 scripts/experiment_runner.py --config experiments/experiments.yaml
+python3 scripts/experiment_runner.py --config experiments/experiments.yaml --plot-only
 ```
-
-See `config/` directory for configuration examples and `experiments_evaluation.yaml` for experiment definitions
 
 ## License
 
@@ -98,19 +96,3 @@ This project includes third-party code:
 ---
 
 **Disclaimer**: This is research software intended for experimental evaluation. It is not recommended for production use. No warranties are provided regarding correctness, performance, or suitability for any particular purpose. Users assume all risks and responsibilities when using this software.
-
-requirements:
-gcc>=12.2.0
-yaml-cpp
-
-add a comment - __attribute__((packed)) MUST not be set in Sherman Fingerprint - this fucks up things
-
-`srun -p arm -n1 -c80 --mem=80g --pty bash`
-
-spack load py-pyaml
-spack load py-matplotlib
-spack load py-numpy
-
-remove core binding support?
-
-add latency in watermark+branch factor experiment?
