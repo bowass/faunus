@@ -1,7 +1,7 @@
 
-CXX = g++
-CXXFLAGS = -std=c++17 -Wall -pthread -Iinclude -Irdma -g -O2
-LDFLAGS = -lyaml-cpp
+CXX := g++
+CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -pthread -O2 -g -I. -Isrc -Iexternals/skiplist/include
+LDFLAGS := -lyaml-cpp
 
 YAMLCPP ?= $(shell spack location -i yaml-cpp 2>/dev/null)
 
@@ -10,13 +10,6 @@ CXXFLAGS += -I$(YAMLCPP)/include
 LDFLAGS  += -L$(firstword $(wildcard $(YAMLCPP)/lib64 $(YAMLCPP)/lib))
 endif
 
-# Compile-time configuration flags (can be overridden on command line)
-# Example: make FAUNUS_BRANCH_FACTOR=128 KEY_SIZE=16
-# - KEY_SIZE: Key size in bytes (default: 8)
-# - VALUE_SIZE: Value size in bytes (default: 8)
-# - FAUNUS_BRANCH_FACTOR: Branch factor for Faunus B+Tree (default: 64)
-# - FAUNUS_SPLIT_WATERMARK: Split threshold 0.0-1.0 (default: 0.75)
-# - FAUNUS_MAINTENANCE_ENABLED: Enable background maintenance thread for Faunus B+Tree (default: disabled)
 ifdef KEY_SIZE
 CXXFLAGS += -DKEY_SIZE=$(KEY_SIZE)
 endif
@@ -35,49 +28,47 @@ CXXFLAGS += -DFAUNUS_MAINTENANCE_ENABLED
 endif
 endif
 
-SRC_DIR = src
-RDMA_DIR = rdma
-KV_DIR = kv_index
-UTIL_DIR = util
-SRC = $(SRC_DIR)/main.cpp \
-      $(RDMA_DIR)/compute_server.cpp \
-      $(RDMA_DIR)/memory_server.cpp \
-      $(RDMA_DIR)/rdma_simulation.cpp \
-      $(RDMA_DIR)/rdma_manager.cpp \
-      $(UTIL_DIR)/profiler.cpp
-OBJ = $(SRC:.cpp=.o)
-TARGET = faunus_sim
+SRC_ROOT := src
+BUILD_ROOT := build
 
-SKIPLIST_DIR = externals/skiplist
-SKIPLIST_INCLUDE = -I$(SKIPLIST_DIR)/include
-CXXFLAGS += $(SKIPLIST_INCLUDE)
-SKIPLIST_SRC = $(SKIPLIST_DIR)/src/skiplist.cc
+CORE_DIRS := rdma kv_index util cache
+CORE_SRCS := $(foreach dir,$(CORE_DIRS),$(wildcard $(SRC_ROOT)/$(dir)/*.cpp))
+CORE_SRCS := $(filter-out $(SRC_ROOT)/cache/bench.cpp,$(CORE_SRCS))
+CORE_OBJS := $(patsubst $(SRC_ROOT)/%.cpp,$(BUILD_ROOT)/%.o,$(CORE_SRCS))
 
-KV_SRC = $(SRC_DIR)/kv_test.cpp \
-         $(RDMA_DIR)/compute_server.cpp \
-         $(RDMA_DIR)/memory_server.cpp \
-         $(RDMA_DIR)/rdma_simulation.cpp \
-         $(RDMA_DIR)/rdma_manager.cpp \
-         $(KV_DIR)/sherman_index.cpp \
-         $(KV_DIR)/faunus_index.cpp \
-         $(UTIL_DIR)/profiler.cpp \
-         $(UTIL_DIR)/cpu_affinity.cpp \
-         $(SKIPLIST_SRC)
-KV_OBJ = $(KV_SRC:.cpp=.o)
-KV_TARGET = kv_test
+APP_SRCS := $(SRC_ROOT)/apps/kv_test.cpp
+APP_OBJS := $(patsubst $(SRC_ROOT)/apps/%.cpp,$(BUILD_ROOT)/apps/%.o,$(APP_SRCS))
 
-all: $(TARGET) $(KV_TARGET)
+BENCH_SRCS := $(SRC_ROOT)/cache/bench.cpp
+BENCH_OBJS := $(patsubst $(SRC_ROOT)/cache/%.cpp,$(BUILD_ROOT)/cache/%.o,$(BENCH_SRCS))
 
-$(TARGET): $(OBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $(OBJ) $(LDFLAGS)
+THIRD_PARTY_SRCS := $(wildcard externals/skiplist/src/*.cc)
+ifeq ($(THIRD_PARTY_SRCS),)
+$(error Skiplist submodule not initialized. Run `git submodule update --init --recursive`.)
+endif
+THIRD_PARTY_OBJS := $(patsubst externals/skiplist/%.cc,$(BUILD_ROOT)/externals/skiplist/%.o,$(THIRD_PARTY_SRCS))
 
-$(KV_TARGET): $(KV_OBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $(KV_OBJ) $(LDFLAGS)
+LIB_OBJS := $(CORE_OBJS) $(THIRD_PARTY_OBJS)
 
-%.o: %.cpp
+TARGETS := kv_test cache_bench
+
+all: $(TARGETS)
+
+kv_test: $(APP_OBJS) $(LIB_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+cache_bench: $(BENCH_OBJS) $(LIB_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(BUILD_ROOT)/%.o: $(SRC_ROOT)/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_ROOT)/externals/skiplist/%.o: externals/skiplist/%.cc
+	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(UTIL_DIR)/*.o $(SRC_DIR)/*.o $(RDMA_DIR)/*.o $(TARGET) $(KV_DIR)/*.o $(KV_TARGET)
+	rm -rf $(BUILD_ROOT) $(TARGETS)
 
 .PHONY: all clean

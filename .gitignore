@@ -1,25 +1,19 @@
-# Build artifacts
 *.o
 *.out
 *.a
 *.so
 *.pyc
 __pycache__/
+build/
 faunus_sim
 kv_test
 
-# Editor files
 *.swp
 *.swo
 *~
 .vscode/
 .idea/
 
-# OS files
-.DS_Store
-Thumbs.db
-
-# Logs and results
 *.log
 logs/
 thread_logs/
